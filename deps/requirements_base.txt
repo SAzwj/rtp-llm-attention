@@ -39,7 +39,7 @@ pynvml
 pyodps
 pyOpenSSL==24.1.0
 safetensors
-sentence-transformers==2.7.0
+sentence-transformers==5.2.0
 sentencepiece==0.2.0
 setproctitle
 setuptools==60.5.0
