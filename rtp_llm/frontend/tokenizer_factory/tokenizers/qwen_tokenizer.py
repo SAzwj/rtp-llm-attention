@@ -1,8 +1,4 @@
-import json
-import os
 from typing import Any, Dict, List
-
-from transformers import AutoTokenizer
 
 from rtp_llm.frontend.tokenizer_factory.tokenizer_factory_register import (
     register_tokenizer,
@@ -35,26 +31,9 @@ class QWenTokenizer(BaseTokenizer):
 
 class QWenV2Tokenizer(BaseTokenizer):
     def init_tokenizer(self, tokenizer_path: str, config_json: Dict[str, Any] = {}):
-        extra_kwargs = self._read_tokenizer_kwargs(tokenizer_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path, verbose=False, trust_remote_code=True, **extra_kwargs
-        )
+        super().init_tokenizer(tokenizer_path, config_json)
         self.tokenizer.im_start_id = self.tokenizer.encode("<|im_start|>")[0]
         self.tokenizer.im_end_id = self.tokenizer.encode("<|im_end|>")[0]
-
-    @staticmethod
-    def _read_tokenizer_kwargs(tokenizer_path: str) -> Dict[str, Any]:
-        """Read kwargs from tokenizer_config.json that transformers 5.x may not
-        auto-pass to custom tokenizer __init__ (e.g. add_eos_token)."""
-        kwargs: Dict[str, Any] = {}
-        config_path = os.path.join(tokenizer_path, "tokenizer_config.json")
-        if not os.path.exists(config_path):
-            return kwargs
-        with open(config_path) as f:
-            tc = json.load(f)
-        if "add_eos_token" in tc:
-            kwargs["add_eos_token"] = tc["add_eos_token"]
-        return kwargs
 
     @property
     def im_start_id(self):

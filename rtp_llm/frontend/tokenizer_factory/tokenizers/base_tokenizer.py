@@ -1,4 +1,6 @@
 import functools
+import json
+import os
 from typing import Any, Dict, List, Union
 
 from transformers import AutoTokenizer
@@ -11,9 +13,59 @@ class BaseTokenizer:
         self.init_tokenizer(tokenizer_path, self.config_json)
 
     def init_tokenizer(self, tokenizer_path: str, config_json: Dict[str, Any]):
+        extra_kwargs = self._transformers_v5_kwargs(tokenizer_path)
         self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path, trust_remote_code=True, verbose=False, use_fast=True
+            tokenizer_path,
+            trust_remote_code=True,
+            verbose=False,
+            use_fast=True,
+            **extra_kwargs,
         )
+
+    @staticmethod
+    def _transformers_v5_kwargs(tokenizer_path: str) -> Dict[str, Any]:
+        """Workaround for transformers==5.2.0 from_pretrained regressions.
+
+        Transformers 5.2.0 rewrote tokenizer loading via TokenizersBackend. Two issues
+        require explicit kwargs to preserve correct behavior:
+
+        1. add_eos_token (found on gte-Qwen2-7B-instruct embedding model):
+           from_pretrained no longer passes add_eos_token from tokenizer_config.json
+           to custom tokenizer __init__. The custom class falls back to its default
+           (False), so EOS is not appended during encode — breaking embedding models
+           that rely on last-token pooling over the EOS position.
+           Fix: explicitly pass add_eos_token from tokenizer_config.json.
+           NOTE: upstream main (fd6bc380c8) intentionally pops add_eos_token when
+           tokenizer.json exists, expecting post_processor to handle it — but models
+           like gte-Qwen2 have no EOS in post_processor. This workaround is needed
+           long-term unless the model's tokenizer.json is updated.
+
+        2. tokenizer_object (affects models with tokenizer_class: LlamaTokenizerFast,
+           e.g. DeepSeek-R1 series):
+           Class-specific __init__ (LlamaTokenizer) unconditionally rebuilds the
+           internal _tokenizer with Metaspace pre_tokenizer, overriding what
+           tokenizer.json defines (e.g. regex Split). This causes whitespace/newlines
+           to be silently dropped during encode ("\\n\\n" -> []).
+           Fix: pass tokenizer_object loaded directly from tokenizer.json.
+           TokenizersBackend.__init__ uses this object to overwrite the class-built
+           _tokenizer, preserving the correct pre_tokenizer/decoder from the file.
+           NOTE: upstream tracks this as huggingface/transformers#45488.
+           Our fix is model-agnostic and stable — keep until upstream is reliable.
+        """
+        kwargs: Dict[str, Any] = {}
+        config_path = os.path.join(tokenizer_path, "tokenizer_config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                tc = json.load(f)
+            if "add_eos_token" in tc:
+                kwargs["add_eos_token"] = tc["add_eos_token"]
+
+        tokenizer_json_path = os.path.join(tokenizer_path, "tokenizer.json")
+        if os.path.exists(tokenizer_json_path):
+            from tokenizers import Tokenizer as TokenizerFast
+
+            kwargs["tokenizer_object"] = TokenizerFast.from_file(tokenizer_json_path)
+        return kwargs
 
     def encode(self, prompt: str, **kwargs):
         return self.tokenizer.encode(prompt, **kwargs)
