@@ -29,13 +29,14 @@ class BaseTokenizer:
         Transformers 5.2.0 rewrote tokenizer loading via TokenizersBackend. Two issues
         require explicit kwargs to preserve correct behavior:
 
-        1. add_eos_token (found on gte-Qwen2-7B-instruct embedding model):
-           from_pretrained no longer passes add_eos_token from tokenizer_config.json
-           to custom tokenizer __init__. The custom class falls back to its default
-           (False), so EOS is not appended during encode — breaking embedding models
-           that rely on last-token pooling over the EOS position.
-           Fix: explicitly pass add_eos_token from tokenizer_config.json.
-           NOTE: upstream main (fd6bc380c8) intentionally pops add_eos_token when
+        1. add_eos_token / add_bos_token (found on gte-Qwen2-7B-instruct and
+           DeepSeek-V2-Lite-Chat respectively):
+           from_pretrained no longer passes these from tokenizer_config.json to
+           custom tokenizer __init__. The custom class falls back to its default
+           (False), so BOS/EOS is not appended during encode — breaking embedding
+           models (last-token pooling) and chat models (missing BOS changes output).
+           Fix: explicitly pass add_eos_token/add_bos_token from tokenizer_config.json.
+           NOTE: upstream main (fd6bc380c8) intentionally pops these when
            tokenizer.json exists, expecting post_processor to handle it — but models
            like gte-Qwen2 have no EOS in post_processor. This workaround is needed
            long-term unless the model's tokenizer.json is updated.
@@ -59,6 +60,8 @@ class BaseTokenizer:
                 tc = json.load(f)
             if "add_eos_token" in tc:
                 kwargs["add_eos_token"] = tc["add_eos_token"]
+            if "add_bos_token" in tc:
+                kwargs["add_bos_token"] = tc["add_bos_token"]
 
         tokenizer_json_path = os.path.join(tokenizer_path, "tokenizer.json")
         if os.path.exists(tokenizer_json_path):
