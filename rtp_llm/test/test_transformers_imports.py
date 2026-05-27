@@ -7,7 +7,6 @@ Scans two sources:
 """
 
 import ast
-import glob
 import importlib
 import json
 import os
@@ -35,7 +34,7 @@ SMOKE_JSON_DIRS = [
     "internal_source/rtp_llm/test/smoke/data/model",
 ]
 
-EXCLUDE_DIRS = {"__pycache__", "3rdparty", "testdata"}
+EXCLUDE_DIRS = {"__pycache__", "3rdparty"}
 
 
 def _find_workspace_root():
