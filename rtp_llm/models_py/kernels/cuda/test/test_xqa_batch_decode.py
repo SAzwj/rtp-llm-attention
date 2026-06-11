@@ -3,10 +3,16 @@ import os
 import signal
 import unittest
 
-import flashinfer
 import torch
-from flashinfer.utils import get_compute_capability
 from packaging import version
+
+try:
+    import flashinfer
+    from flashinfer.utils import get_compute_capability
+
+    _FLASHINFER_AVAILABLE = True
+except ImportError:
+    _FLASHINFER_AVAILABLE = False
 
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.xqa import XQADecodeImpl
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHAImplBase
@@ -33,6 +39,8 @@ GPU_DEVICE = "cuda:0"
 # Check version requirements
 def check_flashinfer_version():
     """Check if flashinfer version >= 0.5.2"""
+    if not _FLASHINFER_AVAILABLE:
+        return False
     try:
         flashinfer_version = version.parse(flashinfer.__version__)
         return flashinfer_version >= version.parse("0.5.2")
@@ -60,7 +68,8 @@ VERSION_REQUIREMENTS_MET = FLASHINFER_VERSION_OK and CUDA_VERSION_OK
 # Skip reason
 SKIP_REASON = []
 if not FLASHINFER_VERSION_OK:
-    SKIP_REASON.append(f"flashinfer version {flashinfer.__version__} < 0.5.2")
+    fi_ver = flashinfer.__version__ if _FLASHINFER_AVAILABLE else "not installed"
+    SKIP_REASON.append(f"flashinfer version {fi_ver} < 0.5.2")
 if not CUDA_VERSION_OK:
     SKIP_REASON.append(f"CUDA version {torch.version.cuda} < 12.8")
 SKIP_MESSAGE = "Requirements not met: " + ", ".join(SKIP_REASON) if SKIP_REASON else ""
@@ -305,7 +314,11 @@ class TestXQABatchDecode(unittest.TestCase):
 
         super().__init__(methodName)
 
-        self.compute_capability = get_compute_capability(torch.device(device="cuda"))[0]
+        self.compute_capability = (
+            get_compute_capability(torch.device(device="cuda"))[0]
+            if _FLASHINFER_AVAILABLE
+            else 0
+        )
         self.xqa_supported = self.compute_capability in [9, 10, 12]
 
     @classmethod
@@ -370,9 +383,11 @@ class TestXQABatchDecode(unittest.TestCase):
         attn_inputs.input_lengths = q_lens
         attn_inputs.kv_cache_block_id_device = page_table
         attn_inputs.kv_cache_kernel_block_id_device = page_table
+        attn_inputs.kv_cache_kernel_block_id_host = page_table.cpu()
         attn_inputs.dtype = get_typemeta(q)
         attn_inputs.total_tokens = q.shape[0]
         attn_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens)
+        attn_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens).cpu()
         attn_inputs.cu_seqlens = generate_cumsum_lens(q_lens).cpu()
         attn_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens).cpu()
 

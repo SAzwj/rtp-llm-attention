@@ -168,6 +168,10 @@ def get_fmha_impl(
         try:
             instance = impl(attn_configs, attn_inputs, parallelism_config)
             if not is_cuda_graph or instance.support_cuda_graph():
+                phase = "prefill" if attn_inputs.is_prefill else "decode"
+                logging.debug(
+                    f"[FMHA] selected {phase} impl: {impl_class_name} (cuda_graph={is_cuda_graph})"
+                )
                 return instance
 
         except Exception as e:
