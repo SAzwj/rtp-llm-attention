@@ -131,28 +131,8 @@ class AutoModel:
         self.size_per_head = self.model_config.attn_config.size_per_head
         self.tokens_per_block = self.model_config.attn_config.tokens_per_block
 
-        # The standalone eager path builds the attention block table by directly
-        # reusing physical block ids as kernel block ids (see
-        # _prepare_*_attention_inputs), which is only correct when one physical block
-        # equals one kernel page (bpk == 1). attn_config.kernel_tokens_per_block is
-        # auto-capped to <=128 when tokens_per_block > 128, silently decoupling it from
-        # the physical block and requiring each physical id to be expanded into bpk
-        # kernel ids (physical_id * bpk + j). standalone does not need large physical
-        # blocks, so enforce bpk == 1 and fail fast instead of silent wrong outputs.
-        assert (
-            self.model_config.attn_config.kernel_tokens_per_block
-            == self.tokens_per_block
-        ), (
-            "standalone AutoModel requires kernel_tokens_per_block "
-            f"({self.model_config.attn_config.kernel_tokens_per_block}) == "
-            f"tokens_per_block ({self.tokens_per_block}); use tokens_per_block <= 128 "
-            "(decoupled large physical blocks are not supported in standalone)"
-        )
-
         self.kv_cache.seq_size_per_block = self.tokens_per_block
-        self.kv_cache.kernel_seq_size_per_block = (
-            self.model_config.attn_config.kernel_tokens_per_block
-        )
+        self.kv_cache.kernel_seq_size_per_block = self.tokens_per_block
         self.kv_cache.num_kv_heads = self.kv_head_num
         self.kv_cache.head_dim = self.size_per_head
         # Explicitly mark every layer as full-attention.

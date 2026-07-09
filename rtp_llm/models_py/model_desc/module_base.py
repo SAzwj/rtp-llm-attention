@@ -57,6 +57,11 @@ class GptModelBase(nn.Module):
         ## (zero behavior change).
         self.backend_plan: dict[int, str] = {}
 
+        ## Dedup for the "decode backend in use" log: capture bs -> last logged backend
+        ## name, so prepare_fmha_impl emits one line per (bs, backend) at capture instead
+        ## of once per replay step.
+        self._logged_decode_backend: dict[int, str] = {}
+
     def initialize(self, init_resource: PyModelInitResources) -> bool:
         self.kv_cache = init_resource.kv_cache
         if self.kv_cache is not None:
@@ -179,6 +184,7 @@ class GptModelBase(nn.Module):
                     self, inputs.attention_inputs, name, is_cuda_graph
                 )
                 if inst is not None:
+                    self._log_decode_backend_once(bs, name, "dynamic-plan")
                     return inst
 
         fmha_impl = AttnImplFactory.get_fmha_impl(
@@ -189,7 +195,32 @@ class GptModelBase(nn.Module):
             self.fmha_config,
             is_cuda_graph,
         )
+        # Authoritative single log of the decode backend actually in use: only on the
+        # cuda graph capture path (once per bs bucket, not per replay step) and only when
+        # dynamic dispatch is on, so the fixed-priority fallback (plan miss) is visible too.
+        if (
+            is_cuda_graph
+            and not inputs.attention_inputs.is_prefill
+            and getattr(
+                self.py_hw_kernel_config, "enable_dynamic_decode_backend", False
+            )
+        ):
+            bs = int(inputs.attention_inputs.input_lengths.size(0))
+            self._log_decode_backend_once(
+                bs, type(fmha_impl).__name__, "fixed-priority"
+            )
         return fmha_impl
+
+    def _log_decode_backend_once(self, bs: int, name: str, source: str) -> None:
+        """Log the decode attention backend actually used for a capture bs bucket, once
+        per (bs, backend), so the CI/process log shows the dynamic dispatch result
+        (dynamic-plan) or the fixed-priority fallback without per-step spam."""
+        if self._logged_decode_backend.get(bs) == name:
+            return
+        self._logged_decode_backend[bs] = name
+        logging.info(
+            "[dispatcher] decode backend in use: bs=%d -> %s (%s)", bs, name, source
+        )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         raise NotImplementedError("forward method must be implemented in subclass")

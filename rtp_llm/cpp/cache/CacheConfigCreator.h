@@ -31,9 +31,6 @@ public:
                                       const std::optional<WarmUpResult>& warm_up_result,
                                       bool                               is_mtp,
                                       bool                               is_eagle);
-
-private:
-    static size_t defaultKernelSeqSizePerBlock(size_t seq_size_per_block);
 };
 
 }  // namespace rtp_llm

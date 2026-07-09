@@ -908,12 +908,6 @@ class PyFlashinferDecodeImpl(FMHAImplBase):
     ) -> bool:
         if attn_configs.use_mla:
             return False
-        # FlashInfer FA2 CG decode path has padding-CTA stride amplification risk
-        # at large page sizes (page.cuh:105: stride = heads * page_size * dim).
-        # Cap at 128 to prevent stride overflow; small page sizes (e.g. 8) are safe.
-        _MAX_SUPPORTED_KERNEL_PAGE_SIZE = 128
-        if attn_configs.kernel_tokens_per_block > _MAX_SUPPORTED_KERNEL_PAGE_SIZE:
-            return False
         return True
 
     def forward(

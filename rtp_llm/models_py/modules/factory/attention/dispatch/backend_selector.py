@@ -176,7 +176,9 @@ def run_backend_selection(
 
     idx = int(code[0].item())
     chosen = registry[idx] if 0 <= idx < len(registry) else None
-    logger.info(
+    # Selection detail kept at debug; the authoritative "decode backend in use" INFO log
+    # is emitted once per bs at the choke point (GptModelBase.prepare_fmha_impl).
+    logger.debug(
         "[dispatcher] bs=%d -> %s",
         bs,
         chosen or "(left empty, fall back to fixed priority)",
