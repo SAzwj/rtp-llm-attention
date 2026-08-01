@@ -7,8 +7,10 @@ import traceback
 import unittest
 
 import requests
+
 from rtp_llm.ops import RoleType
 from rtp_llm.start_frontend_server import start_frontend_server
+from rtp_llm.test.utils.port_util import PortsContext
 
 
 class FrontendAppTest(unittest.TestCase):
@@ -23,12 +25,22 @@ class FrontendAppTest(unittest.TestCase):
         # Keep only script name
         py_env_configs = setup_args()
         py_env_configs.role_config.role_type = RoleType.FRONTEND
-        # Override with test-specific settings
-        py_env_configs.server_config.start_port = 36000
+        # Override with test-specific settings.
+        # Never hardcode start_port: the test runs on shared CI workers where
+        # a fixed port races with concurrent jobs (Errno 98 Address already in
+        # use). Lock a free consecutive range matching the port layout
+        # (base + 0..worker_info_port_num-1) and hold the locks for the whole
+        # test via addCleanup.
         py_env_configs.server_config.frontend_server_count = 1
         py_env_configs.server_config.rank_id = 0
         py_env_configs.server_config.frontend_server_id = 0
         py_env_configs.server_config.worker_info_port_num = 8
+        ports_ctx = PortsContext(
+            num_ports=py_env_configs.server_config.worker_info_port_num
+        )
+        ports = ports_ctx.__enter__()
+        self.addCleanup(ports_ctx.__exit__, None, None, None)
+        py_env_configs.server_config.start_port = ports[0]
         # Enable fake process mode to avoid loading actual model
         py_env_configs.profiling_debug_logging_config.debug_start_fake_process = 1
 
