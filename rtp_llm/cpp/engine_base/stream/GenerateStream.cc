@@ -136,7 +136,11 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
 }
 
 void GenerateStream::resetBeginTime(int64_t begin_time_us) {
+    std::lock_guard<std::mutex> lock(*mutex_);
     begin_time_us_ = begin_time_us;
+    if (running_started_) {
+        running_started_time_us_ = begin_time_us;
+    }
 }
 
 void GenerateStream::recordWaitTime() {
@@ -723,7 +727,7 @@ void GenerateStream::checkTimeout() {
 // 外部线程调用时自动加锁保护 error_info 和 events_ 的一致性。
 void GenerateStream::reportEvent(StreamEvents::EventType event, ErrorCode error_code, const std::string& error_msg) {
     std::lock_guard<std::mutex> lock(*mutex_);
-    generate_status_->reportEvent(event, error_code, error_msg);
+    reportEventWithoutLock(event, error_code, error_msg);
 }
 
 // 无锁版本，供已持有 mutex_ 的内部调用路径使用（如 update/specUpdate/moveToNext 链路）。
@@ -731,11 +735,15 @@ void GenerateStream::reportEventWithoutLock(StreamEvents::EventType event,
                                             ErrorCode               error_code,
                                             const std::string&      error_msg) {
     generate_status_->reportEvent(event, error_code, error_msg);
+    if (event == StreamEvents::GenerateDone && !generation_done_) {
+        generation_done_         = true;
+        generation_done_time_us_ = autil::TimeUtility::currentTimeInMicroSeconds();
+    }
 }
 
 void GenerateStream::reportError(ErrorCode error_code, const std::string& error_msg) {
     std::lock_guard<std::mutex> lock(*mutex_);
-    generate_status_->reportEvent(StreamEvents::Error, error_code, error_msg);
+    reportEventWithoutLock(StreamEvents::Error, error_code, error_msg);
 }
 
 bool GenerateStream::hasEvent(StreamEvents::EventType event) const {
@@ -763,10 +771,24 @@ void GenerateStream::setReserveStep(size_t reserve_step) {
 StreamState GenerateStream::moveToNext() {
     checkTimeout();
     std::lock_guard<std::mutex> lock(*mutex_);
-    StreamState                 state = generate_status_->moveToNext();
+    const auto                  old_status = getStatus();
+    StreamState                 state      = generate_status_->moveToNext();
+    const auto                  new_status = getStatus();
+
+    if ((old_status == StreamState::WAITING && new_status != StreamState::WAITING)
+        || (old_status != StreamState::RUNNING && new_status == StreamState::RUNNING && !running_started_)) {
+        const auto transition_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        if (old_status == StreamState::WAITING && new_status != StreamState::WAITING) {
+            wait_time_us_ = transition_time_us - begin_time_us_;
+        }
+        if (old_status != StreamState::RUNNING && new_status == StreamState::RUNNING && !running_started_) {
+            running_started_         = true;
+            running_started_time_us_ = transition_time_us;
+        }
+    }
 
     // notify one thread waiting for stream completion
-    if (getStatus() == StreamState::FINISHED) {
+    if (new_status == StreamState::FINISHED) {
         cv_->notify_one();
     }
     return state;
@@ -1629,10 +1651,20 @@ void GenerateStream::CopyOnWrite(const GenerateStream& other_stream, bool copy_l
 }
 
 GenerateStream::TimeInfo GenerateStream::getTimeInfo() {
-    return {begin_time_us_,
-            wait_time_us_,
-            complete_token_ids_->firstTokenTimeUs(),
-            complete_token_ids_->firstTokenLatencyUs()};
+    std::lock_guard<std::mutex> lock(*mutex_);
+    const auto                  first_token_time_us = complete_token_ids_->firstTokenTimeUs();
+
+    TimeInfo time_info;
+    time_info.begin_time_us           = begin_time_us_;
+    time_info.wait_time_us            = wait_time_us_;
+    time_info.running_started         = running_started_;
+    time_info.running_started_time_us = running_started_time_us_;
+    time_info.first_token_committed   = first_token_time_us > 0;
+    time_info.first_token_time_us     = first_token_time_us;
+    time_info.first_token_rt_us       = first_token_time_us > 0 ? first_token_time_us - begin_time_us_ : 0;
+    time_info.generation_done         = generation_done_;
+    time_info.generation_done_time_us = generation_done_time_us_;
+    return time_info;
 }
 
 bool GenerateStream::queryPdSep() const {

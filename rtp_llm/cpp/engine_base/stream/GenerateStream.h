@@ -763,10 +763,15 @@ public:
 
 public:
     struct TimeInfo {
-        int64_t begin_time_us;
-        int64_t wait_time_us;
-        int64_t first_token_time_us;
-        int64_t first_token_rt_us;
+        int64_t begin_time_us           = 0;
+        int64_t wait_time_us            = 0;  // legacy metric/metadata field
+        bool    running_started         = false;
+        int64_t running_started_time_us = 0;
+        bool    first_token_committed   = false;
+        int64_t first_token_time_us     = 0;
+        int64_t first_token_rt_us       = 0;
+        bool    generation_done         = false;
+        int64_t generation_done_time_us = 0;
     };
     TimeInfo getTimeInfo();
     bool     queryPdSep() const;
@@ -797,23 +802,27 @@ protected:
     // Non-beam return sequences can finish at different steps. Keep the
     // terminal length before finished rows are padded with EOS while the
     // remaining rows continue decoding.
-    std::vector<int64_t>                 sub_generate_output_lengths_;
-    int                                  max_seq_len_;
-    int64_t                              vocab_size_;
-    std::shared_ptr<CompleteTokenIds>    complete_token_ids_;
-    int64_t                              begin_time_us_;
-    int64_t                              wait_time_us_       = 0;
-    bool                                 wait_time_recorded_ = false;
-    std::shared_ptr<StreamCacheResource> stream_cache_resource_;
-    std::shared_ptr<bool>                is_context_stream_;
-    size_t                               iter_count_                         = 0;
-    size_t                               sp_iter_count_                      = 0;
-    int64_t                              speculative_verify_rounds_          = 0;
-    int64_t                              speculative_accepted_token_num_     = 0;
-    int64_t                              speculative_proposed_draft_tokens_  = 0;
-    int64_t                              context_execute_time_us_            = 0;
-    int64_t                              context_execute_time_with_cache_us_ = 0;
-    int64_t                              generate_execute_time_us_           = 0;
+    std::vector<int64_t>                  sub_generate_output_lengths_;
+    int                                   max_seq_len_;
+    int64_t                               vocab_size_;
+    std::shared_ptr<CompleteTokenIds>     complete_token_ids_;
+    int64_t                               begin_time_us_;
+    int64_t                               wait_time_us_            = 0;
+    bool                                  wait_time_recorded_      = false;
+    bool                                  running_started_         = false;
+    int64_t                               running_started_time_us_ = 0;
+    bool                                  generation_done_         = false;
+    int64_t                               generation_done_time_us_ = 0;
+    std::shared_ptr<StreamCacheResource>  stream_cache_resource_;
+    std::shared_ptr<bool>                 is_context_stream_;
+    size_t                                iter_count_                         = 0;
+    size_t                                sp_iter_count_                      = 0;
+    int64_t                               speculative_verify_rounds_          = 0;
+    int64_t                               speculative_accepted_token_num_     = 0;
+    int64_t                               speculative_proposed_draft_tokens_  = 0;
+    int64_t                               context_execute_time_us_            = 0;
+    int64_t                               context_execute_time_with_cache_us_ = 0;
+    int64_t                               generate_execute_time_us_           = 0;
     // Private cumulative contributions used only by the frontend TPS side
     // channel. One stream owns each complete engine step, so token/time pairs
     // cannot be split by unordered RPC delivery or a heartbeat boundary.

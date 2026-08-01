@@ -10,6 +10,9 @@
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/models/logits_processor/ThinkModeLogitsProcessor.h"
 
+#include <atomic>
+#include <future>
+
 using namespace std;
 
 namespace rtp_llm {
@@ -53,12 +56,14 @@ public:
         std::shared_ptr<GenerateInput>  generate_input(new GenerateInput());
         std::shared_ptr<GenerateConfig> generate_config(new GenerateConfig());
         generate_config->num_return_sequences = 2;
+        generate_input->begin_time_us         = autil::TimeUtility::currentTimeInMicroSeconds();
         generate_input->input_ids =
             torch::tensor(std::vector<int32_t>(input_ids.begin(), input_ids.end()), torch::kInt32);
         generate_input->generate_config = generate_config;
         ModelConfig   model_config;
         RuntimeConfig runtime_config;
         model_config.max_seq_len = 2048;
+        model_config.vocab_size  = 1024;
         auto stream              = std::make_shared<NormalGenerateStream>(
             generate_input, model_config, runtime_config, resource_context, nullptr);
 
@@ -91,6 +96,28 @@ private:
 class GenerateStreamTest: public DeviceTestBase {
 protected:
 };
+
+void updateOneToken(const GenerateStreamPtr& stream, int token_id) {
+    const auto new_tokens = torch::full(
+        {static_cast<int64_t>(stream->currentBatchSize()), 1}, token_id, torch::TensorOptions().dtype(torch::kInt32));
+    stream->update({new_tokens,
+                    1,
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    true,
+                    false,
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    -1,
+                    1});
+}
 
 TEST_F(GenerateStreamTest, testConstruct) {
     auto builder = GenerateStreamBuilder();
@@ -521,6 +548,123 @@ TEST_F(GenerateStreamTest, testMtpAsyncDeviceStateBackCompatWrappers) {
     ASSERT_FALSE(stream->getAcceptTokensGpu().defined());
     ASSERT_FALSE(stream->getNextSeqLenGpu().defined());
     ASSERT_FALSE(stream->getProposeTokensGpu().defined());
+}
+
+TEST_F(GenerateStreamTest, timeInfoSeparatesLegacyWaitFromRunningMilestone) {
+    auto builder = GenerateStreamBuilder();
+
+    auto waiting_error = builder.createComplexContextStream({1, 2, 3});
+    waiting_error->resetBeginTime(autil::TimeUtility::currentTimeInMicroSeconds() - 2000);
+    waiting_error->reportError(ErrorCode::CANCELLED, "cancelled while waiting");
+    EXPECT_EQ(waiting_error->moveToNext(), StreamState::FINISHED);
+    auto waiting_info = waiting_error->getTimeInfo();
+    EXPECT_GT(waiting_info.wait_time_us, 0);
+    EXPECT_FALSE(waiting_info.running_started);
+    EXPECT_EQ(waiting_info.running_started_time_us, 0);
+
+    auto loading_error = builder.createComplexContextStream({1, 2, 3});
+    {
+        std::lock_guard<std::mutex> lock(*loading_error->mutex_);
+        loading_error->generate_status_->status.store(StreamState::LOADING_CACHE);
+        loading_error->wait_time_us_ = 1234;
+    }
+    loading_error->reportError(ErrorCode::CANCELLED, "cancelled while loading");
+    EXPECT_EQ(loading_error->moveToNext(), StreamState::FINISHED);
+    auto loading_info = loading_error->getTimeInfo();
+    EXPECT_EQ(loading_info.wait_time_us, 1234);
+    EXPECT_FALSE(loading_info.running_started);
+
+    auto running = builder.createComplexContextStream({1, 2, 3});
+    running->reportEvent(StreamEvents::CanRun);
+    EXPECT_EQ(running->moveToNext(), StreamState::RUNNING);
+    auto running_info = running->getTimeInfo();
+    EXPECT_TRUE(running_info.running_started);
+    EXPECT_GE(running_info.running_started_time_us, running_info.begin_time_us);
+    const auto legacy_wait_time_us = running_info.wait_time_us;
+
+    const auto reset_begin_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+    running->resetBeginTime(reset_begin_time_us);
+    auto reset_info = running->getTimeInfo();
+    EXPECT_EQ(reset_info.begin_time_us, reset_begin_time_us);
+    EXPECT_EQ(reset_info.running_started_time_us, reset_begin_time_us);
+    EXPECT_EQ(reset_info.wait_time_us, legacy_wait_time_us);
+}
+
+TEST_F(GenerateStreamTest, timeInfoPublishesFirstTokenAndGenerateDoneOnlyAfterCommit) {
+    auto builder = GenerateStreamBuilder();
+
+    auto       invalid            = builder.createComplexContextStream({1, 2, 3});
+    const auto invalid_seq_length = invalid->seqLength();
+    updateOneToken(invalid, 1024);
+    auto invalid_info = invalid->getTimeInfo();
+    EXPECT_EQ(invalid->seqLength(), invalid_seq_length);
+    EXPECT_FALSE(invalid_info.first_token_committed);
+    EXPECT_EQ(invalid_info.first_token_time_us, 0);
+    EXPECT_FALSE(invalid_info.generation_done);
+
+    auto valid                             = builder.createComplexContextStream({1, 2, 3});
+    valid->generateConfig()->pd_separation = true;
+    valid->reportEvent(StreamEvents::CanRun);
+    ASSERT_EQ(valid->moveToNext(), StreamState::RUNNING);
+    updateOneToken(valid, 42);
+
+    auto info = valid->getTimeInfo();
+    EXPECT_TRUE(info.running_started);
+    EXPECT_TRUE(info.first_token_committed);
+    EXPECT_TRUE(info.generation_done);
+    EXPECT_EQ(info.first_token_rt_us, info.first_token_time_us - info.begin_time_us);
+    EXPECT_GE(info.first_token_time_us, info.running_started_time_us);
+    EXPECT_GE(info.generation_done_time_us, info.first_token_time_us);
+    EXPECT_EQ(valid->getStatus(), StreamState::RUNNING);
+}
+
+TEST_F(GenerateStreamTest, timeInfoSnapshotIsCoherentDuringLifecyclePublication) {
+    auto builder                            = GenerateStreamBuilder();
+    auto stream                             = builder.createComplexContextStream({1, 2, 3});
+    stream->generateConfig()->pd_separation = true;
+
+    std::atomic<bool>  start{false};
+    std::atomic<bool>  done{false};
+    std::atomic<bool>  inconsistent{false};
+    std::promise<void> first_snapshot;
+    auto               first_snapshot_signal = first_snapshot.get_future();
+    auto               reader                = std::async(std::launch::async, [&] {
+        while (!start.load(std::memory_order_acquire)) {}
+        bool first_snapshot_published = false;
+        while (!done.load(std::memory_order_acquire)) {
+            const auto info = stream->getTimeInfo();
+            if (!first_snapshot_published) {
+                first_snapshot.set_value();
+                first_snapshot_published = true;
+            }
+            if (info.running_started != (info.running_started_time_us > 0)
+                || info.first_token_committed != (info.first_token_time_us > 0)
+                || info.generation_done != (info.generation_done_time_us > 0)
+                || (info.first_token_committed
+                    && info.first_token_rt_us != info.first_token_time_us - info.begin_time_us)
+                || (info.running_started && info.first_token_committed
+                    && info.first_token_time_us < info.running_started_time_us)
+                || (info.first_token_committed && info.generation_done
+                    && info.generation_done_time_us < info.first_token_time_us)) {
+                inconsistent.store(true, std::memory_order_release);
+                return;
+            }
+        }
+    });
+
+    start.store(true, std::memory_order_release);
+    first_snapshot_signal.wait();
+    stream->reportEvent(StreamEvents::CanRun);
+    ASSERT_EQ(stream->moveToNext(), StreamState::RUNNING);
+    updateOneToken(stream, 42);
+    done.store(true, std::memory_order_release);
+    reader.get();
+
+    EXPECT_FALSE(inconsistent.load(std::memory_order_acquire));
+    const auto final_info = stream->getTimeInfo();
+    EXPECT_TRUE(final_info.running_started);
+    EXPECT_TRUE(final_info.first_token_committed);
+    EXPECT_TRUE(final_info.generation_done);
 }
 
 }  // namespace rtp_llm
