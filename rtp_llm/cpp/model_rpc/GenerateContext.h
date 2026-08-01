@@ -1,11 +1,14 @@
 #pragma once
 
+#include <memory>
+
 #include "grpc++/grpc++.h"
 #include "rtp_llm/cpp/utils/TimeUtil.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include "rtp_llm/cpp/model_rpc/RpcServerRuntimeMeta.h"
+#include "rtp_llm/cpp/telemetry/RpcTraceHelper.h"
 
 namespace rtp_llm {
 
@@ -52,6 +55,11 @@ public:
     kmonitor::MetricsReporterPtr          metrics_reporter;
     std::shared_ptr<RpcServerRuntimeMeta> meta;
 
+    // OTel SERVER span finish guard. Declared last so it destructs FIRST and
+    // can still read `error_status` above; nullptr when telemetry is disabled.
+    // Ends the span on every exit path (RAII).
+    std::unique_ptr<telemetry::GrpcStatusSpanGuard> trace_span_guard;
+
 protected:
     std::shared_ptr<GenerateStream> stream_;
 
@@ -76,9 +84,8 @@ protected:
                 ErrorCode::GENERATE_TIMEOUT,                                                                           \
                 "request cost time is " + std::to_string(request_cost_time_ms) + " ms" + ", request timeout is "       \
                     + std::to_string(generate_context.request_timeout_ms) + " ms");                                    \
-            generate_context.error_status = serializeErrorMsg(generate_context.request_key, \
-                                                              generate_context.request_info, \
-                                                              generate_context.error_info); \
+            generate_context.error_status = serializeErrorMsg(                                                         \
+                generate_context.request_key, generate_context.request_info, generate_context.error_info);             \
             return generate_context.error_status;                                                                      \
         }                                                                                                              \
     }
@@ -86,9 +93,8 @@ protected:
 #define CHECK_REQUEST_CANCELLED(generate_context)                                                                      \
     if (generate_context.server_context->IsCancelled()) {                                                              \
         generate_context.error_info   = ErrorInfo(ErrorCode::CANCELLED, "request is cancelled");                       \
-        generate_context.error_status = serializeErrorMsg(generate_context.request_key, \
-                                                          generate_context.request_info, \
-                                                          generate_context.error_info); \
+        generate_context.error_status = serializeErrorMsg(                                                             \
+            generate_context.request_key, generate_context.request_info, generate_context.error_info);                 \
         return generate_context.error_status;                                                                          \
     }
 

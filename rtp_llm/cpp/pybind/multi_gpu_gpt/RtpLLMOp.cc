@@ -14,6 +14,7 @@
 #include "rtp_llm/cpp/engine_base/EngineInitParams.h"
 #include "rtp_llm/cpp/engine_base/ProposeModelEngineInitParams.h"
 #include "rtp_llm/cpp/engine_base/WeightsConverter.h"
+#include "rtp_llm/cpp/telemetry/TelemetryRuntime.h"
 #include "rtp_llm/cpp/pybind/PyUtils.h"
 #include "rtp_llm/cpp/models/models_weight/W.h"
 
@@ -317,6 +318,18 @@ void RtpLLMOp::initRPCServer(const EngineInitParams                        maga_
             && maga_init_params.parallelism_config.tp_size > maga_init_params.parallelism_config.local_world_size;
         // NOTE: ip/ip段可自定义为所需范围。
         server_address = "0.0.0.0:" + std::to_string(model_rpc_port);
+        // trace telemetry runtime: init once role/rank are known; only
+        // tp_rank==0 enables span production, and it is off unless explicitly
+        // enabled by env
+        {
+            std::string trace_role = role_type == RoleType::PREFILL ? "prefill" :
+                                     role_type == RoleType::DECODE  ? "decode" :
+                                                                      "pdfusion";
+            telemetry::TelemetryRuntime::init(trace_role,
+                                              maga_init_params.parallelism_config.tp_rank,
+                                              maga_init_params.parallelism_config.dp_rank,
+                                              maga_init_params.parallelism_config.world_rank);
+        }
         if (role_type == RoleType::PREFILL || role_type == RoleType::DECODE) {
             model_rpc_service_.reset(new RemoteRpcServiceImpl());
         } else {
@@ -432,6 +445,8 @@ void RtpLLMOp::stop() {
             http_server_->stop();
             http_server_.reset();
         }
+        // bounded flush of remaining spans; never blocks process exit
+        telemetry::TelemetryRuntime::shutdown();
         stopKmonitorFactory();
     }
 }

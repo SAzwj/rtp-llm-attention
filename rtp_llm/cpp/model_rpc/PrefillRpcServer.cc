@@ -7,6 +7,7 @@
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/cpp/utils/HashUtil.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorFactory.h"
+#include "rtp_llm/cpp/telemetry/PhaseSpanSynthesizer.h"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -453,7 +454,7 @@ const bool kHasRemoteRpcServerIp = []() {
                 new_error_msg += "stream wait time is " + std::to_string(wait_time_ms) + "ms, ";                       \
             }                                                                                                          \
         }                                                                                                              \
-        auto status = prefill_context.closeGrpcStream();                                                               \
+        auto status = prefill_context.closeGrpcStream(ErrorCodeToString(new_error_code));                              \
         if (!status.ok()) {                                                                                            \
             const auto& error_msg = status.error_message();                                                            \
             if (error_msg.find("Connect Failed") != std::string::npos) {                                               \
@@ -532,6 +533,8 @@ ErrorInfo PrefillRpcServer::waitStreamBeforeRun(std::shared_ptr<GenerateStream> 
 
 void PrefillRpcServer::getRpcConnection(PrefillGenerateContext& prefill_context) {
     RTP_LLM_PROFILE_FUNCTION();
+    prefill_context.trace_server_address.clear();
+    prefill_context.trace_server_port = 0;
     RTP_LLM_LOG_DEBUG("request [%ld] trans query", prefill_context.request_id);
     auto input                   = QueryConverter::transQuery(prefill_context.rpc_context.request);
     prefill_context.request_info = input->request_info;
@@ -596,6 +599,15 @@ void PrefillRpcServer::getRpcConnection(PrefillGenerateContext& prefill_context)
     }
     prefill_context.decode_addr     = decode_addr;
     prefill_context.grpc_connection = connect_status.value();
+    if (prefill_context.trace_span_guard && prefill_context.trace_span_guard->valid()) {
+        try {
+            prefill_context.trace_server_address = host->ip;
+            prefill_context.trace_server_port    = host->rpc_port;
+        } catch (...) {
+            prefill_context.trace_server_address.clear();
+            prefill_context.trace_server_port = 0;
+        }
+    }
 
     RTP_LLM_LOG_DEBUG("request [%ld] get rpc connection done", prefill_context.request_id);
 }
@@ -624,6 +636,25 @@ void PrefillRpcServer::remoteAllocateResource(PrefillGenerateContext& prefill_co
     RTP_LLM_PROFILE_FUNCTION();
     RTP_LLM_LOG_DEBUG("request [%ld] start to remote allocate resource", prefill_context.request_id);
     prefill_context.client_context.reset(new ClientContext());
+    if (prefill_context.trace_span_guard && prefill_context.trace_span_guard->valid()) {
+        if (prefill_context.pd_client_span_guard) {
+            prefill_context.pd_client_span_guard->setAttribute(telemetry::kAttrErrorType, "Retry");
+            prefill_context.pd_client_span_guard->finish(opentelemetry::trace::StatusCode::kError,
+                                                         "Prefill-to-decode RPC attempt failed before a retry");
+        }
+        auto client_span =
+            telemetry::startChildClientSpan("rtp_llm.remote_generate",
+                                            prefill_context.trace_span_guard->sharedSpan(),
+                                            prefill_context.trace_server_address,
+                                            prefill_context.trace_server_port,
+                                            prefill_context.request_id,
+                                            telemetry::retryAttemptFromExecutionCount(prefill_context.retry_times),
+                                            "RpcService/RemoteGenerate");
+        if (client_span != nullptr) {
+            prefill_context.pd_client_span_guard = std::make_unique<telemetry::RequestSpanGuard>(client_span);
+            telemetry::injectSpanToClientContext(prefill_context.client_context.get(), client_span);
+        }
+    }
     auto    request_timeout_ms = prefill_context.request_timeout_ms;
     auto    max_rpc_timeout_ms = maga_init_params_.pd_sep_config.max_rpc_timeout_ms;
     int64_t final_timeout_ms   = request_timeout_ms > 0 ? request_timeout_ms : max_rpc_timeout_ms;
@@ -972,6 +1003,52 @@ grpc::Status PrefillRpcServer::GenerateStreamCall(grpc::ServerContext*          
                                                   meta_);
     prefill_context.onflight_requests      = onflight_requests_;
     prefill_context.loading_cache_requests = loading_cache_requests_;
+
+    // Prefill SERVER span is created only on the PD path, AFTER the fallback
+    // check above, so Local/Prefill each own exactly one SERVER span. RAII
+    // guard covers EXECUTE_STAGE_FUNC early returns and exceptions.
+    if (telemetry::TelemetryRuntime::isActive()) {
+        auto span = telemetry::startRpcServerSpan(
+            "rtp_llm.prefill_generate_stream_call", server_context, true, "RpcService/GenerateStreamCall");
+        prefill_context.trace_span_guard =
+            std::make_unique<telemetry::GrpcStatusSpanGuard>(span, &prefill_context.error_status);
+        // Bailian Unitrace index key (string) + internal numeric field
+        prefill_context.trace_span_guard->setAttribute(telemetry::kAttrRequestId,
+                                                       std::to_string(prefill_context.request_id));
+        prefill_context.trace_span_guard->setAttribute(telemetry::kAttrRtpLlmRequestId, prefill_context.request_id);
+    }
+    telemetry::PhaseSpanSynthesisScope phase_span_scope([&prefill_context](bool exception_unwinding) {
+        if (!prefill_context.trace_span_guard || !prefill_context.trace_span_guard->valid()) {
+            return;
+        }
+        auto& stream = prefill_context.getStream();
+        if (!stream) {
+            return;
+        }
+        const auto             time_info  = stream->getTimeInfo();
+        const bool             request_ok = prefill_context.error_status.ok() && !exception_unwinding;
+        telemetry::PhaseTiming phase_timing;
+        phase_timing.begin_time_us           = time_info.begin_time_us;
+        phase_timing.running_started         = time_info.running_started;
+        phase_timing.running_started_time_us = time_info.running_started_time_us;
+        phase_timing.first_token_committed   = time_info.first_token_committed;
+        phase_timing.first_token_time_us     = time_info.first_token_time_us;
+        phase_timing.generation_done         = time_info.generation_done;
+        phase_timing.generation_done_time_us = time_info.generation_done_time_us;
+        phase_timing.synthesis_end_time_us   = currentTimeUs();
+        phase_timing.request_id              = prefill_context.request_id;
+        phase_timing.error_type              = request_ok ?
+                                                   nullptr :
+                                                   (!prefill_context.error_status.ok() ?
+                                                        telemetry::grpcStatusCodeName(prefill_context.error_status.error_code()) :
+                                                        "Exception");
+        telemetry::synthesizePhaseSpans(
+            prefill_context.trace_span_guard->sharedSpan(), phase_timing, telemetry::PhaseRole::Prefill, request_ok);
+        if (request_ok && time_info.generation_done) {
+            telemetry::setUsageTokenAttributes(
+                *prefill_context.trace_span_guard, (int64_t)stream->inputLength(), (int64_t)stream->outputTokenLen());
+        }
+    });
 
     auto max_retry_times      = maga_init_params_.pd_sep_config.prefill_retry_times;
     auto max_retry_timeout_ms = maga_init_params_.pd_sep_config.prefill_retry_timeout_ms;

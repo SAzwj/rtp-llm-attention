@@ -17,6 +17,7 @@
 #include "rtp_llm/cpp/utils/DevicePin.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/models_py/bindings/core/RuntimeDevice.h"
+#include "rtp_llm/cpp/telemetry/PhaseSpanSynthesizer.h"
 #include "autil/LockFreeThreadPool.h"
 #include <c10/core/DeviceGuard.h>
 
@@ -221,21 +222,35 @@ void DecodeRpcServer::loadCacheFromPrefill(DecodeGenerateContext& decode_context
             }
         }
     }
+    const auto error_reason = error_info.ok() ? std::string() : ErrorCodeToString(error_info.code());
     if (!error_info.ok()) {
+        decode_context.error_info = error_info;
         RTP_LLM_LOG_WARNING("request [%s] load kv cache failed, error code [%s], cost time [%ld] ms",
                             decode_context.request_key.c_str(),
                             error_info.ToString().c_str(),
                             decode_context.time_info.loadCacheTimeMs());
+    }
+    // load_cache child span [load_begin, load_end): decode's KV-arrival wait
+    // window, parallel to the prefill computation (see synthesizeKvLoadSpan).
+    // Synthesized on failure too — CACHE_STORE_LOAD_BUFFER_TIMEOUT lives here
+    // and must show up on the waterfall instead of an unnamed gap.
+    if (decode_context.trace_span_guard && decode_context.trace_span_guard->valid()) {
+        telemetry::synthesizeKvLoadSpan(decode_context.trace_span_guard->sharedSpan(),
+                                        decode_context.time_info.load_begin_time_us,
+                                        decode_context.time_info.load_end_time_us,
+                                        decode_context.request_id,
+                                        error_info.ok(),
+                                        error_info.ok() ? nullptr : error_reason.c_str(),
+                                        static_cast<int64_t>(error_info.code()),
+                                        error_reason.c_str());
     }
 
     GenerateOutputsPB load_response;
     load_response.mutable_error_info()->set_error_code(transErrorCodeToRPC(error_info.code()));
     GRPC_RET_IF_ERROR(
         decode_context, grpc_stream->Write(load_response), grpc::StatusCode::INTERNAL, "send load response failed");
-    if (!error_info.ok()) {
-        decode_context.error_info = error_info;
-    }
-    GRPC_RET_IF_ERROR(decode_context, error_info.ok(), grpc::StatusCode::INTERNAL, error_info.ToString().c_str());
+    GRPC_RET_IF_ERROR(
+        decode_context, error_info.ok(), transErrorCodeToGrpc(error_info.code()), error_info.ToString().c_str());
     RTP_LLM_LOG_DEBUG("request [%s] load cache from prefill done", decode_context.request_key.c_str());
 }
 
@@ -1279,12 +1294,67 @@ grpc::Status DecodeRpcServer::RemoteGenerate(grpc::ServerContext* server_context
     decode_context.onflight_requests = onflight_requests_;
     decode_context.loading_cache_requests = loading_cache_requests_;
 
+    // Decode SERVER span: wrapping the handler covers the whole decode
+    // lifecycle of this request; RemoteLoad fan-out stays span-free
+    // (aggregate attribute strategy). RAII guard covers all exit paths.
+    if (telemetry::TelemetryRuntime::isActive()) {
+        auto span = telemetry::startRpcServerSpan(
+            "rtp_llm.decode_remote_generate", server_context, true, "RpcService/RemoteGenerate");
+        decode_context.trace_span_guard =
+            std::make_unique<telemetry::GrpcStatusSpanGuard>(span, &decode_context.error_status);
+    }
+    telemetry::PhaseSpanSynthesisScope phase_span_scope([&decode_context](bool exception_unwinding) {
+        if (!decode_context.trace_span_guard || !decode_context.trace_span_guard->valid()) {
+            return;
+        }
+        auto& stream = decode_context.getStream();
+        if (!stream) {
+            return;
+        }
+        const auto             time_info  = stream->getTimeInfo();
+        const bool             request_ok = decode_context.error_status.ok() && !exception_unwinding;
+        telemetry::PhaseTiming phase_timing;
+        phase_timing.begin_time_us           = time_info.begin_time_us;
+        phase_timing.running_started         = time_info.running_started;
+        phase_timing.running_started_time_us = time_info.running_started_time_us;
+        phase_timing.first_token_committed   = time_info.first_token_committed;
+        phase_timing.first_token_time_us     = time_info.first_token_time_us;
+        phase_timing.generation_done         = time_info.generation_done;
+        phase_timing.generation_done_time_us = time_info.generation_done_time_us;
+        phase_timing.synthesis_end_time_us   = currentTimeUs();
+        phase_timing.request_id              = decode_context.request_id;
+        const bool cache_dependency_failure  = !request_ok
+                                              && decode_context.stat_info.stage == DecodeStatInfo::loadCacheFromPrefill
+                                              && decode_context.error_info.hasError()
+                                              && decode_context.error_status.error_code() == grpc::StatusCode::INTERNAL;
+        phase_timing.error_type =
+            request_ok ? nullptr :
+                         (cache_dependency_failure ?
+                              "DependencyFailure" :
+                              (!decode_context.error_status.ok() ?
+                                   telemetry::grpcStatusCodeName(decode_context.error_status.error_code()) :
+                                   "Exception"));
+        telemetry::synthesizePhaseSpans(
+            decode_context.trace_span_guard->sharedSpan(), phase_timing, telemetry::PhaseRole::Decode, request_ok);
+        if (request_ok && time_info.generation_done) {
+            telemetry::setUsageTokenAttributes(
+                *decode_context.trace_span_guard, (int64_t)stream->inputLength(), (int64_t)stream->outputTokenLen());
+        }
+    });
+
     auto max_retry_times      = maga_init_params_.pd_sep_config.decode_retry_times;
     auto max_retry_timeout_ms = maga_init_params_.pd_sep_config.decode_retry_timeout_ms;
     int  retry_interval_ms    = maga_init_params_.pd_sep_config.decode_retry_interval_ms;
 
     try {
         EXECUTE_STAGE_FUNC(prepareGenerateContext, decode_context);
+        if (decode_context.trace_span_guard) {
+            // request_id becomes known only after the first ALLOCATE message;
+            // `request_id` (string) is the Bailian Unitrace index key
+            decode_context.trace_span_guard->setAttribute(telemetry::kAttrRequestId,
+                                                          std::to_string(decode_context.request_id));
+            decode_context.trace_span_guard->setAttribute(telemetry::kAttrRtpLlmRequestId, decode_context.request_id);
+        }
         EXECUTE_WITH_RETRY(
             allocateResourceFunc, decode_context, max_retry_times, max_retry_timeout_ms, retry_interval_ms);
         if (decode_context.hasError()) {

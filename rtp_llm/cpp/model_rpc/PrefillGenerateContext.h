@@ -62,14 +62,13 @@ public:
                            std::shared_ptr<RpcServerRuntimeMeta> meta):
         GenerateContext(rpc_context.requestID(), timeout_ms, server_context, metrics_reporter, meta),
         resource(resource),
-        rpc_context(rpc_context)
-    {
+        rpc_context(rpc_context) {
         prefill_worker_cache_store_addrs = resource->workers;
     }
     ~PrefillGenerateContext();
     void         reset() override;
     void         nextStage();
-    grpc::Status closeGrpcStream();
+    grpc::Status closeGrpcStream(const std::string& attempt_error_override = "");
     void         closeGrpcConnection();
 
 private:
@@ -84,6 +83,8 @@ public:
     RPCContext                           rpc_context;
     std::shared_ptr<GenerateInput>       generate_input;
     std::string                          decode_addr;
+    std::string                          trace_server_address;
+    int64_t                              trace_server_port = 0;
     std::vector<std::string>             prefill_worker_cache_store_addrs;
     GrpcConnection                       grpc_connection;
     std::shared_ptr<RpcService::Stub>    stub;
@@ -92,8 +93,14 @@ public:
     bool                                 grpc_stream_closed             = false;
     grpc::Status                         last_grpc_stream_closed_status = grpc::Status::OK;
     PrefillStatInfo                      stat_info;
-    int64_t                              loading_cache_requests = 0;
+    int64_t                              loading_cache_requests           = 0;
     bool                                 recent_cache_key_metric_reported = false;
+
+    // P->D RemoteGenerate CLIENT span. Recreated per retry attempt in
+    // remoteAllocateResource (each attempt injects into the
+    // freshly built ClientContext); the final one is finished against the
+    // bidi-stream terminal status in closeGrpcStream / destructor.
+    std::unique_ptr<telemetry::RequestSpanGuard> pd_client_span_guard;
 };
 
 }  // namespace rtp_llm

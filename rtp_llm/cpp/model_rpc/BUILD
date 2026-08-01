@@ -86,6 +86,7 @@ cc_library(
         "//rtp_llm/cpp/metrics",
         "//rtp_llm/cpp/multimodal_processor",
         "//rtp_llm/cpp/normal_engine",
+        "//rtp_llm/cpp/telemetry",
         "//rtp_llm/cpp/utils:atomic_util",
         "//rtp_llm/cpp/utils:kv_cache_utils",
         "//rtp_llm/cpp/utils:hash_util",
