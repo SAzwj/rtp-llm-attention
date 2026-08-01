@@ -1,7 +1,8 @@
+import asyncio
 import functools
 import json
 import logging
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Optional
 
 import grpc
 import torch
@@ -21,6 +22,9 @@ from rtp_llm.server.request_headers import (
     extract_correlation_request_id,
     extract_trace_id,
 )
+from rtp_llm.telemetry import CURRENT_TRACE_STATE
+from rtp_llm.telemetry import attributes as trace_attrs
+from rtp_llm.telemetry import start_client_span
 from rtp_llm.utils.base_model_datatypes import (
     AuxInfo,
     GenerateConfig,
@@ -30,6 +34,86 @@ from rtp_llm.utils.base_model_datatypes import (
 )
 from rtp_llm.utils.grpc_host_channel_pool import GrpcHostChannelPool
 from rtp_llm.utils.grpc_util import trans_option, trans_option_cast, trans_tensor
+
+
+def _selected_pd_separation(
+    selected_role: Optional[RoleType], generate_config: GenerateConfig
+) -> Optional[bool]:
+    if selected_role == RoleType.PDFUSION:
+        return False
+    if selected_role != RoleType.PREFILL:
+        return None
+    return (
+        generate_config.max_new_tokens > 1
+        and generate_config.num_beams <= 1
+        and not generate_config.variable_num_beams
+        and generate_config.num_return_sequences <= 1
+        and generate_config.can_use_pd_separation
+    )
+
+
+def _engine_reported_finished(outputs: Optional[GenerateOutputs]) -> bool:
+    if outputs is None or not outputs.generate_outputs:
+        return False
+    return all(bool(out.finished) for out in outputs.generate_outputs)
+
+
+def _request_completed_normally(trace_state: Any) -> bool:
+    if trace_state is None:
+        return False
+    try:
+        return trace_state.renderer_completed is True or trace_state.settled_ok is True
+    except Exception:
+        return False
+
+
+async def _wait_for_rpc_termination(response_iterator: Any) -> Any:
+    try:
+        code = getattr(response_iterator, "code", None)
+        if code is not None:
+            return await code()
+    except Exception:
+        pass
+    return None
+
+
+def _record_client_rpc_status(client_span: Any, status: Any) -> None:
+    if client_span is None or status is None:
+        return
+    try:
+        value = getattr(status, "name", None)
+        if value:
+            client_span.set_attribute(trace_attrs.RPC_RESPONSE_STATUS_CODE, str(value))
+    except Exception:
+        pass
+
+
+def _record_client_span_usage(
+    client_span: Any, outputs: Optional[GenerateOutputs]
+) -> None:
+    if client_span is None:
+        return
+    try:
+        generate_outputs = outputs.generate_outputs if outputs is not None else []
+        if not generate_outputs:
+            return
+        aux_infos = [out.aux_info for out in generate_outputs]
+        input_len = aux_infos[0].input_len
+        if (
+            input_len <= 0
+            or any(aux.input_len != input_len for aux in aux_infos)
+            or any(aux.output_len <= 0 for aux in aux_infos)
+        ):
+            return
+        output_len = sum(aux.output_len for aux in aux_infos)
+        client_span.set_attribute("gen_ai.span.kind", "LLM")
+        client_span.set_attribute("gen_ai.usage.input_tokens", input_len)
+        client_span.set_attribute("gen_ai.usage.output_tokens", output_len)
+        client_span.set_attribute("gen_ai.usage.prompt_tokens", input_len)
+        client_span.set_attribute("gen_ai.usage.completion_tokens", output_len)
+        client_span.set_attribute("gen_ai.usage.total_tokens", input_len + output_len)
+    except Exception:
+        pass
 
 
 class StreamState:
@@ -576,9 +660,11 @@ class ModelRpcClient(object):
         )
         input_pb = trans_input(input_py)
         response_iterator = None
+        rpc_status = None
         stream_state = StreamState()
 
         address_list = self._addresses
+        selected_role = None
 
         for role_addr in input_py.generate_config.role_addrs:
             if (
@@ -588,27 +674,50 @@ class ModelRpcClient(object):
             ):
                 if role_addr.ip != "":
                     address_list = [role_addr.ip + ":" + str(role_addr.grpc_port)]
+                    selected_role = role_addr.role
                     break
 
         if not address_list:
             raise ValueError(f"No address found for request: {input_pb.request_id}")
+        target_address = address_list[input_py.request_id % len(address_list)]
         logging.debug(
-            f"request: [{input_pb.request_id}] send to address: {address_list[input_py.request_id % len(address_list)]}"
+            f"request: [{input_pb.request_id}] send to address: {target_address}"
         )
+
+        trace_state = CURRENT_TRACE_STATE.get()
+        pd_separation = _selected_pd_separation(selected_role, input_py.generate_config)
+        if pd_separation is not None and trace_state is not None:
+            trace_state.set_attribute(trace_attrs.RTP_LLM_PD_SEP, pd_separation)
+
+        client_span, trace_metadata = start_client_span(
+            "rtp_llm.generate_stream_call", target_address
+        )
+        if client_span is not None:
+            client_span.set_attribute("request_id", str(input_py.request_id))
+            client_span.set_attribute("rtp_llm.request_id", input_py.request_id)
+        last_output = None
+
         try:
-            # Select target address
-            target_address = address_list[input_py.request_id % len(address_list)]
             logging.debug(f"target_address: {target_address}")
             # Get channel from pool
             channel = await self._channel_pool.get(target_address)
             stub = RpcServiceStub(channel)
 
             grpc_kwargs = {"timeout": effective_ms / 1000.0} if effective_ms > 0 else {}
+            if trace_metadata:
+                grpc_kwargs["metadata"] = trace_metadata
             response_iterator = stub.GenerateStreamCall(input_pb, **grpc_kwargs)
             # 调用服务器方法并接收流式响应
             async for response in response_iterator.__aiter__():
-                yield trans_output(input_py, response, stream_state)
+                output_py = trans_output(input_py, response, stream_state)
+                last_output = output_py
+                yield output_py
         except grpc.RpcError as e:
+            rpc_status = e.code()
+            if client_span is not None:
+                _record_client_rpc_status(client_span, rpc_status)
+                _record_client_span_usage(client_span, last_output)
+                client_span.finish(error=e, error_type="RpcError")
             # TODO(xinfei.sxf) 非流式的请求无法取消了
             if response_iterator:
                 response_iterator.cancel()
@@ -651,9 +760,38 @@ class ModelRpcClient(object):
                     raise FtRuntimeException(exception_type, details)
                 else:
                     raise FtRuntimeException(ExceptionType.UNKNOWN_ERROR, e.details())
+        except (asyncio.CancelledError, GeneratorExit) as e:
+            engine_finished = _engine_reported_finished(last_output)
+            if response_iterator:
+                if not engine_finished:
+                    response_iterator.cancel()
+                if rpc_status is None:
+                    rpc_status = await _wait_for_rpc_termination(response_iterator)
+                _record_client_rpc_status(client_span, rpc_status)
+            if client_span is not None:
+                _record_client_span_usage(client_span, last_output)
+                if engine_finished or _request_completed_normally(trace_state):
+                    client_span.finish()
+                else:
+                    client_span.finish(error=e, error_type="Cancelled")
+            raise
         except Exception as e:
+            if response_iterator:
+                response_iterator.cancel()
+                if rpc_status is None:
+                    rpc_status = await _wait_for_rpc_termination(response_iterator)
+                _record_client_rpc_status(client_span, rpc_status)
+            if client_span is not None:
+                _record_client_span_usage(client_span, last_output)
+                client_span.finish(error=e)
             logging.error(f"rpc unknown error:{str(e)}")
             raise e
         finally:
+            if client_span is not None:
+                if response_iterator and rpc_status is None:
+                    rpc_status = await _wait_for_rpc_termination(response_iterator)
+                _record_client_rpc_status(client_span, rpc_status)
+                _record_client_span_usage(client_span, last_output)
+                client_span.finish()
             if response_iterator:
                 response_iterator.cancel()

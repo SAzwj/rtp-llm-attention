@@ -16,8 +16,7 @@ from fastapi import Request as RawRequest
 from fastapi import status
 from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse
-from fastapi.responses import StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from typing_extensions import override
 from uvicorn import Config, Server
 from uvicorn.loops.auto import auto_loop_setup
@@ -34,6 +33,7 @@ from rtp_llm.embedding.embedding_type import TYPE_STR, EmbeddingType
 from rtp_llm.frontend.frontend_server import FrontendServer
 from rtp_llm.frontend.shutdown_manager import FrontendShutdownManager
 from rtp_llm.openai.api_datatype import ChatCompletionRequest
+from rtp_llm.telemetry import init_telemetry, shutdown_telemetry
 from rtp_llm.utils.grpc_client_wrapper import GrpcClientWrapper
 from rtp_llm.utils.util import async_request_server
 from rtp_llm.utils.version_info import VersionInfo
@@ -295,6 +295,8 @@ class FrontendApp(object):
         )
 
     def start(self):
+        # Per-process initialization; this is a no-op unless tracing is enabled.
+        init_telemetry("frontend", 0)
         self.frontend_server.start()
         app = self.create_app()
 
@@ -343,6 +345,8 @@ class FrontendApp(object):
             server.run()
         except BaseException as e:
             raise e
+        finally:
+            shutdown_telemetry()
 
     def create_app(self):
         middleware = [
