@@ -96,6 +96,7 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     complete_token_ids_ = std::make_shared<CompleteTokenIds>(
         init_batch_size, maxBatchSize(), max_seq_len_, model_config.attn_config.tokens_per_block);
     complete_token_ids_->init(input, extra_reserve_token_num);
+    think_token_scan_position_ = inputLength();
 
     last_output_pos_                 = seqLength();
     last_frontend_metric_output_pos_ = last_output_pos_;
@@ -949,8 +950,13 @@ bool GenerateStream::needFinishBySPTokens(int num_new_tokens) {
         // update sub_generate_status to RUNNING for beam search,
         // as the same batch_id may refers to different beams between steps
         fillSubGenerateStatus(StreamState::RUNNING);
+        // Beam updates rewrite and reorder complete rows, so output 0 cannot
+        // inherit the previous step's scan position or natural-close state.
+        think_token_scan_position_ = inputLength();
+        think_naturally_closed_    = false;
     }
 
+    matchThinkTerminateToken();
     if (seqLength() >= generate_input_->generate_config->min_new_tokens + inputLength()) {
         matchEosToken();
         matchStopWordsList();
@@ -963,6 +969,36 @@ bool GenerateStream::needFinishBySPTokens(int num_new_tokens) {
     return std::all_of(sub_generate_status_.begin(), sub_generate_status_.end(), [](StreamState state) {
         return state == StreamState::FINISHED;
     });
+}
+
+void GenerateStream::matchThinkTerminateToken() {
+    const auto& config = generate_input_->generate_config;
+    if (!config->in_think_mode || config->think_terminate_token_id <= 0 || think_naturally_closed_) {
+        return;
+    }
+    if (think_token_scan_position_ > seqLength()) {
+        think_token_scan_position_ = inputLength();
+    }
+    const auto* token_ids       = complete_token_ids_->data(0);
+    const bool  has_close_token = !config->end_think_token_ids.empty();
+    const int   close_token_id  = has_close_token ? config->end_think_token_ids.front() : 0;
+    // Dash phase switching is driven by output 0. Once its control token is
+    // observed, the whole physical phase-1 call is complete; waiting for other
+    // choices would force the caller to cancel an otherwise successful RPC.
+    // A natural </think> first keeps the physical stream alive for its answer.
+    for (int position = think_token_scan_position_; position < seqLength(); ++position) {
+        if (token_ids[position] == config->think_terminate_token_id) {
+            complete_token_ids_->setSeqLength(position + 1);
+            think_token_scan_position_ = position + 1;
+            fillSubGenerateStatus(StreamState::FINISHED);
+            return;
+        }
+        if (has_close_token && token_ids[position] == close_token_id) {
+            think_naturally_closed_ = true;
+            return;
+        }
+    }
+    think_token_scan_position_ = seqLength();
 }
 
 void GenerateStream::matchEosToken() {

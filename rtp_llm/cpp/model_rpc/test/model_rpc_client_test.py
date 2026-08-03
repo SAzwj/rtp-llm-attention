@@ -178,6 +178,18 @@ class ModelRpcClientTest(TestCase):
             asdict(output.generate_outputs[0].aux_info),
         )
 
+    def test_trans_input_serializes_think_terminate_token_id(self):
+        input_py = GenerateInput(
+            request_id=123,
+            token_ids=torch.tensor([1, 2]),
+            mm_inputs=[],
+            generate_config=GenerateConfig(think_terminate_token_id=42),
+        )
+
+        self.assertEqual(
+            trans_input(input_py).generate_config.think_terminate_token_id, 42
+        )
+
     @unittest.skip("need fix")
     def test_generate_stream(self):
         client = FakeModelRpcClient()

@@ -1,5 +1,5 @@
 # BUILD for rtp_llm/dash_sc: Python frontend gRPC (same pattern as model_rpc).
-load("//bazel:arch_select.bzl", "requirement")
+load("//bazel:arch_select.bzl", "requirement", "telemetry_test_deps")
 
 requirement(["grpcio"])
 
@@ -40,6 +40,7 @@ py_library(
     data = [":grpc_client_scripts"],
     visibility = ["//visibility:public"],
     deps = [
+        "//rtp_llm:telemetry",
         "//rtp_llm/server:server",
         ":grpcio",
         "//rtp_llm/access_logger:access_logger",
@@ -77,7 +78,7 @@ py_test(
     name = "inference_servicer_test",
     srcs = ["test/inference/servicer_test.py"],
     main = "test/inference/servicer_test.py",
-    deps = ["//rtp_llm:testlib"],
+    deps = ["//rtp_llm:testlib"] + telemetry_test_deps(),
     imports = [],
     exec_properties = {"gpu": "A10"},
 )
@@ -96,7 +97,7 @@ py_test(
     name = "proxy_servicer_test",
     srcs = ["test/proxy/servicer_test.py"],
     main = "test/proxy/servicer_test.py",
-    deps = ["//rtp_llm:testlib"],
+    deps = ["//rtp_llm:testlib"] + telemetry_test_deps(),
     imports = [],
     exec_properties = {"gpu": "A10"},
 )

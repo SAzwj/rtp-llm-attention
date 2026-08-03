@@ -108,6 +108,9 @@ message GenerateConfigPB {
     bool return_logprobs = 64;
     uint32 top_logprobs = 65;
     bool frontend_metric_streaming = 66;
+    // Ends the whole think-mode physical call when output 0 emits this control
+    // token. Unlike regular stop words, this is not gated by min_new_tokens.
+    int32 think_terminate_token_id = 74;
 }
 
 message MMPreprocessConfigPB {

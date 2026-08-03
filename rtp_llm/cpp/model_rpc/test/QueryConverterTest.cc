@@ -70,6 +70,7 @@ TEST_F(QueryConverterTest, testTransInput) {
     generate_config_pb->set_calculate_loss(1);
     generate_config_pb->set_return_hidden_states(true);
     generate_config_pb->set_frontend_metric_streaming(true);
+    generate_config_pb->set_think_terminate_token_id(42);
     for (int i = 0; i < 2; ++i) {
         auto* stop_words = generate_config_pb->mutable_stop_words_list()->add_rows();
         for (int j = 0; j < 3; ++j) {
@@ -101,6 +102,7 @@ TEST_F(QueryConverterTest, testTransInput) {
     ASSERT_EQ(generate_config->calculate_loss, 1);
     ASSERT_TRUE(generate_config->return_hidden_states);
     ASSERT_TRUE(generate_config->frontend_metric_streaming);
+    ASSERT_EQ(generate_config->think_terminate_token_id, 42);
     ASSERT_FALSE(generate_config->return_logits);
     ASSERT_EQ(generate_config->stop_words_list.size(), 2);
     vector<int> stop_words_1{0, 1, 2};

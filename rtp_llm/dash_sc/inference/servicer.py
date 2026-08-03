@@ -59,6 +59,10 @@ from rtp_llm.server.request_headers import (
     extract_request_headers,
     extract_trace_id,
 )
+from rtp_llm.telemetry import CURRENT_TRACE_STATE
+from rtp_llm.telemetry import attributes as trace_attrs
+from rtp_llm.telemetry import start_server_span
+from rtp_llm.telemetry.tracing import metadata_to_headers
 from rtp_llm.utils.base_model_datatypes import GenerateInput, RequestInfo
 from rtp_llm.utils.util import AtomicCounter
 
@@ -75,6 +79,16 @@ _EMPTY_THINK_BODY = "\n"
 _DEFAULT_TERMINATE_TOKEN_ID = 1
 _FINISH_REASON_NOT_FINISHED = 2
 _PARTIAL_RESPONSE_METADATA = (("x-dashscope-partialresponse", "true"),)
+GrpcMetadata = Iterable[tuple[object, object]]
+_DASH_RPC_METHOD = "GRPCInferenceService/ModelStreamInfer"
+_DASH_SERVER_SPAN_NAME = "dash_sc.ModelStreamInfer"
+_DASH_SERVER_ATTRIBUTES = {
+    "gen_ai.span.kind": "LLM",
+    "gen_ai.operation.name": "chat",
+    "gen_ai.system": "rtp_llm",
+    "rpc.system": "grpc",
+    "rpc.method": _DASH_RPC_METHOD,
+}
 
 
 def _exception_metric_code(error_code: Any) -> str:
@@ -183,12 +197,32 @@ def stream_log_tag(
 def _headers_from_invocation_metadata(
     invocation_metadata: Optional[Any],
 ) -> dict[str, str]:
-    metadata_headers = {
-        str(key).lower(): value
-        for key, value in invocation_metadata or ()
-        if key is not None and value is not None
-    }
-    return extract_request_headers(metadata_headers)
+    return extract_request_headers(metadata_to_headers(invocation_metadata))
+
+
+def _finish_server_trace(
+    trace_state, record: GrpcAccessRecord, exc: Optional[BaseException]
+) -> None:
+    if trace_state is None:
+        return
+    try:
+        if record.engine_ttft_ms is not None:
+            trace_state.set_attribute(
+                trace_attrs.GEN_AI_TIME_TO_FIRST_TOKEN, record.engine_ttft_ms
+            )
+        if record.engine_tpot_ms is not None:
+            trace_state.set_attribute(
+                trace_attrs.RTP_LLM_ENGINE_TIME_PER_OUTPUT_TOKEN_MS,
+                record.engine_tpot_ms,
+            )
+        if record.status == "OK":
+            trace_state.finish()
+        else:
+            error_type = "Cancelled" if record.status == "CANCELLED" else record.status
+            trace_state.finish(error=exc, error_type=error_type)
+    finally:
+        if CURRENT_TRACE_STATE.get() is trace_state:
+            CURRENT_TRACE_STATE.set(None)
 
 
 async def _send_partial_response_metadata(context: Any) -> None:
@@ -745,6 +779,8 @@ async def iter_real_model_stream_infer(
     matched_echo_ids = _matched_echo_prefix_ids(input_ids_list, echo_prefix_ids)
     should_echo = bool(matched_echo_ids)
     echoed = False
+    stream: object | None = None
+    phase2_stream: object | None = None
     try:
         generate_config = sampling.to_generate_config(other=other)
         generate_config.trace_id = trace_str
@@ -793,7 +829,11 @@ async def iter_real_model_stream_infer(
         eos_id = runtime.eos_token_id
         max_id = runtime.max_token_id
         term_id = runtime.terminate_token_id
-        think_close_token_id = runtime.close_token_id
+        think_close_token_id = (
+            int(generate_config.end_think_token_ids[0])
+            if generate_config.end_think_token_ids
+            else runtime.close_token_id
+        )
         max_new_tokens = int(getattr(generate_config, "max_new_tokens", 0) or 0)
         request_max_new_think_tokens = sampling.max_new_think_tokens
         if request_max_new_think_tokens is None:
@@ -806,6 +846,9 @@ async def iter_real_model_stream_infer(
         # sets it from generate_config and a request can override it.
         phase2_enabled = runtime.phase2_enabled and bool(
             getattr(generate_config, "in_think_mode", False)
+        )
+        generate_config.think_terminate_token_id = (
+            term_id if phase2_enabled and term_id is not None else 0
         )
         cumulative_sent_ids: list[int] = []
         generate_think_token_num: Optional[int] = None
@@ -855,9 +898,16 @@ async def iter_real_model_stream_infer(
             prompt_cached_token_num = (
                 int(aux_info.reuse_len) if aux_info is not None else 0
             )
-            if access_agg is not None and aux_info is not None and aux_info.role_addrs:
-                # model_rpc_client copies the final submitted role_addrs here.
-                access_agg.record_role_addrs(aux_info.role_addrs, phase="phase1")
+            if access_agg is not None and aux_info is not None:
+                access_agg.record_engine_token_latency(
+                    phase="phase1",
+                    cost_time_ms=aux_info.cost_time,
+                    first_token_cost_time_ms=aux_info.first_token_cost_time,
+                    output_len=aux_info.output_len,
+                )
+                if aux_info.role_addrs:
+                    # model_rpc_client copies the final submitted role_addrs here.
+                    access_agg.record_role_addrs(aux_info.role_addrs, phase="phase1")
             if not generated_ids and not out_py.finished:
                 continue
             ids_for_accounting = generated_ids
@@ -1233,6 +1283,7 @@ async def iter_real_model_stream_infer(
             phase2_config.in_think_mode = False
             if hasattr(phase2_config, "thinking"):
                 phase2_config.thinking = False
+            phase2_config.think_terminate_token_id = 0
             if sampling.max_new_tokens_from_completion_alias:
                 phase2_config.max_new_tokens = (
                     _phase2_max_new_tokens_for_completion_alias(
@@ -1312,13 +1363,18 @@ async def iter_real_model_stream_infer(
                 prompt_cached_token_num = (
                     int(aux_info.reuse_len) if aux_info is not None else 0
                 )
-                if (
-                    access_agg is not None
-                    and aux_info is not None
-                    and aux_info.role_addrs
-                ):
-                    # model_rpc_client copies the final submitted role_addrs here.
-                    access_agg.record_role_addrs(aux_info.role_addrs, phase="phase2")
+                if access_agg is not None and aux_info is not None:
+                    access_agg.record_engine_token_latency(
+                        phase="phase2",
+                        cost_time_ms=aux_info.cost_time,
+                        first_token_cost_time_ms=aux_info.first_token_cost_time,
+                        output_len=aux_info.output_len,
+                    )
+                    if aux_info.role_addrs:
+                        # model_rpc_client copies the final submitted role_addrs here.
+                        access_agg.record_role_addrs(
+                            aux_info.role_addrs, phase="phase2"
+                        )
                 response = build_stream_response_from_generate_outputs(
                     dash_sc_request_id=f"{request.id}{_PHASE2_SUFFIX}",
                     model_name=request.model_name,
@@ -1513,6 +1569,11 @@ async def iter_real_model_stream_infer(
         )
         stats = (0, None, None, len(input_ids_list), 0, ())
         yield (response, stats) if yield_access_stats else response
+    finally:
+        if phase2_stream is not None:
+            await _close_async_stream_if_possible(phase2_stream, tag)
+        if stream is not None:
+            await _close_async_stream_if_possible(stream, tag)
 
 
 # ----------------------------------------------------------------------------
@@ -1698,10 +1759,18 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         )
 
     async def ModelStreamInfer(self, request_iterator, context):
+        try:
+            invocation_metadata = context.invocation_metadata()
+        except Exception:
+            invocation_metadata = ()
         # Self-managed access-log lifecycle (the shared interceptor is gone).
         # Create/arrival/query go first — before any inbound frame — so a
         # frame-less RPC (peer closed before sending) still reports arrival and
         # produces an access line via the ``finally`` below.
+        # The record is built before the SERVER span and the two reporting calls
+        # sit inside the ``try``: nothing that can raise runs between span start
+        # and ``try``, so the span can never escape without ``finally`` ending it
+        # and clearing CURRENT_TRACE_STATE.
         record = GrpcAccessRecord.create(
             context,
             "ModelStreamInfer",
@@ -1716,18 +1785,23 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
             streaming=True,
             speculative_steps=self._speculative_steps,
         )
-        emit_query_log(record, rank_id=self._rank_id, server_id=self._server_id)
-        report_arrival(rank_id=self._rank_id, server_id=self._server_id)
+        trace_state = start_server_span(
+            _DASH_SERVER_SPAN_NAME,
+            metadata_to_headers(invocation_metadata),
+            _DASH_SERVER_ATTRIBUTES,
+        )
         exc: Optional[BaseException] = None
         try:
-            try:
-                invocation_metadata = context.invocation_metadata()
-            except Exception:
-                invocation_metadata = ()
+            emit_query_log(record, rank_id=self._rank_id, server_id=self._server_id)
+            report_arrival(rank_id=self._rank_id, server_id=self._server_id)
             partial_metadata_sent = False
             first_request = True
             async for request in request_iterator:
                 record.req_count += 1
+                rtp_llm_request_id = self._next_rtp_llm_request_id()
+                if trace_state is not None:
+                    trace_state.set_attribute("request_id", str(rtp_llm_request_id))
+                    trace_state.set_attribute("rtp_llm.request_id", rtp_llm_request_id)
                 logging.debug(
                     "[DashScGrpc] ModelInferRequest: id=%s model_name=%s",
                     request.id,
@@ -1827,25 +1901,26 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                         )
                         yield resp
                     return
-                else:
-                    async for resp, stats in iter_real_model_stream_infer(
-                        request,
-                        input_ids_list,
-                        sampling,
-                        other,
-                        self._backend_visitor,
-                        rtp_llm_request_id=self._next_rtp_llm_request_id(),
-                        echo_prefix_ids=self._echo_prefix_ids,
-                        extra_stop_word_ids=self._extra_stop_word_ids,
-                        invocation_metadata=invocation_metadata,
-                        tokenizer=self._tokenizer,
-                        generate_env_config=self._generate_env_config,
-                        think_runtime=self._think_runtime,
-                        phase2_request_id_factory=self._next_rtp_llm_request_id,
-                        access_agg=record,
-                        yield_access_stats=True,
-                        frontend_metric_tags=self._frontend_metric_tags(),
-                    ):
+                response_iter = iter_real_model_stream_infer(
+                    request,
+                    input_ids_list,
+                    sampling,
+                    other,
+                    self._backend_visitor,
+                    rtp_llm_request_id=rtp_llm_request_id,
+                    echo_prefix_ids=self._echo_prefix_ids,
+                    extra_stop_word_ids=self._extra_stop_word_ids,
+                    invocation_metadata=invocation_metadata,
+                    tokenizer=self._tokenizer,
+                    generate_env_config=self._generate_env_config,
+                    think_runtime=self._think_runtime,
+                    phase2_request_id_factory=self._next_rtp_llm_request_id,
+                    access_agg=record,
+                    yield_access_stats=True,
+                    frontend_metric_tags=self._frontend_metric_tags(),
+                )
+                try:
+                    async for resp, stats in response_iter:
                         (
                             delta_len,
                             finished,
@@ -1871,7 +1946,9 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                             finished=bool(finished),
                         )
                         yield resp
-                    return
+                finally:
+                    await response_iter.aclose()
+                return
             if first_request:
                 record.mark_request_done("eof")
         except BaseException as e:
@@ -1895,4 +1972,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     status=record.status,
                 )
             finally:
-                record.frontend_metric_state.finish()
+                try:
+                    record.frontend_metric_state.finish()
+                finally:
+                    _finish_server_trace(trace_state, record, exc)
