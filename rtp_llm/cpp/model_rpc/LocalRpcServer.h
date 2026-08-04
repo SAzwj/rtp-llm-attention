@@ -103,7 +103,8 @@ public:
     typedef grpc::internal::WriterInterface<GenerateOutputsPB> WriterInterface;
 
 protected:
-    grpc::Status serializeErrorMsg(const std::string& request_key, ErrorInfo error_info);
+    static grpc::Status responseStreamWriteFailedStatus();
+    grpc::Status        serializeErrorMsg(const std::string& request_key, ErrorInfo error_info);
     grpc::Status
          serializeErrorMsg(const std::string& request_key, const RequestInfo& request_info, ErrorInfo error_info);
     bool applyTimelineGate(const std::string& request_key,

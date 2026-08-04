@@ -39,10 +39,18 @@ torch::TensorOptions runtimeCudaI32Options() {
 }  // namespace
 
 #define GRPC_RET_IF_ERROR(decode_context, stat, code, msg)                                                             \
-    if (!(stat)) {                                                                                                     \
-        decode_context.error_status = grpc::Status(code, msg);                                                         \
-        return;                                                                                                        \
-    }
+    do {                                                                                                               \
+        if (!(stat)) {                                                                                                 \
+            const auto        grpc_error_code    = (code);                                                             \
+            const std::string grpc_error_message = (msg);                                                              \
+            decode_context.error_status          = grpc::Status(grpc_error_code, grpc_error_message);                  \
+            RTP_LLM_LOG_WARNING("request [%s] RPC stage failed, grpc status code [%d], message [%s]",                  \
+                                decode_context.request_key.c_str(),                                                    \
+                                static_cast<int>(grpc_error_code),                                                     \
+                                grpc_error_message.c_str());                                                           \
+            return;                                                                                                    \
+        }                                                                                                              \
+    } while (false)
 
 string makeRequestKey(const string& client_id, size_t request_id) {
     return client_id + "_request_id_" + std::to_string(request_id);
@@ -68,6 +76,13 @@ torch::Tensor pinGrpcTensor(torch::Tensor tensor) {
 }
 
 }  // namespace
+
+grpc::Status DecodeRpcServer::generateRequestReadFailureStatus(bool cancelled) {
+    if (cancelled) {
+        return grpc::Status(grpc::StatusCode::CANCELLED, "request is cancelled");
+    }
+    return grpc::Status(grpc::StatusCode::INTERNAL, "poll generate request failed");
+}
 
 grpc::Status DecodeRpcServer::init(const EngineInitParams&                                maga_init_params,
                                    py::object                                             mm_process_engine,
@@ -230,10 +245,15 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
     auto&             grpc_stream     = decode_context.rpc_context.grpc_stream;
     auto&             generate_stream = decode_context.getStream();
     GenerateRequestPB generate_request;
-    GRPC_RET_IF_ERROR(decode_context,
-                      grpc_stream->Read(&generate_request),
-                      grpc::StatusCode::INTERNAL,
-                      "poll generate request failed");
+    if (!grpc_stream->Read(&generate_request)) {
+        const bool cancelled        = decode_context.server_context->IsCancelled();
+        decode_context.error_status = generateRequestReadFailureStatus(cancelled);
+        RTP_LLM_LOG_WARNING("request [%s] read generate request failed, cancelled [%d], grpc status code [%d]",
+                            decode_context.request_key.c_str(),
+                            cancelled ? 1 : 0,
+                            static_cast<int>(decode_context.error_status.error_code()));
+        return;
+    }
     GRPC_RET_IF_ERROR(decode_context,
                       generate_request.stage() == RemoteStage::GENERATE,
                       grpc::StatusCode::INTERNAL,

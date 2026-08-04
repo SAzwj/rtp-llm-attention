@@ -109,6 +109,10 @@ LocalRpcServer::serializeErrorMsg(const string& request_key, const RequestInfo& 
     }
 }
 
+grpc::Status LocalRpcServer::responseStreamWriteFailedStatus() {
+    return grpc::Status(grpc::StatusCode::CANCELLED, "request write outputs pb failed");
+}
+
 grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*             context,
                                               const string&                    request_key,
                                               WriterInterface*                 writer,
@@ -141,7 +145,7 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*             c
         if (!writer->Write(outputs_pb)) {
             stream->reportError(ErrorCode::CANCELLED, "write outputs pb failed");
             RTP_LLM_LOG_WARNING("request [%s] write outputs pb failed", request_key.c_str());
-            return grpc::Status(grpc::StatusCode::INTERNAL, "request write outputs pb failed");
+            return responseStreamWriteFailedStatus();
         }
         if (stream->hasEvent(StreamEvents::NeedRemoteGenerate)) {
             break;

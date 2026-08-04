@@ -78,6 +78,7 @@ private:
     BroadcastLoadRequestPB constructRemoteLoadRequestForMla(const LoadKVCacheContext&       load_context,
                                                             int                             index,
                                                             const std::vector<std::string>& peer_ips) const;
+    static grpc::Status    generateRequestReadFailureStatus(bool cancelled);
 
 private:
     autil::ThreadPoolBasePtr thread_pool_;
