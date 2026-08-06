@@ -59,9 +59,7 @@ from rtp_llm.server.request_headers import (
     extract_request_headers,
     extract_trace_id,
 )
-from rtp_llm.telemetry import CURRENT_TRACE_STATE
-from rtp_llm.telemetry import attributes as trace_attrs
-from rtp_llm.telemetry import start_server_span
+from rtp_llm.telemetry import CURRENT_TRACE_STATE, start_server_span
 from rtp_llm.telemetry.tracing import metadata_to_headers
 from rtp_llm.utils.base_model_datatypes import GenerateInput, RequestInfo
 from rtp_llm.utils.util import AtomicCounter
@@ -206,15 +204,6 @@ def _finish_server_trace(
     if trace_state is None:
         return
     try:
-        if record.engine_ttft_ms is not None:
-            trace_state.set_attribute(
-                trace_attrs.GEN_AI_TIME_TO_FIRST_TOKEN, record.engine_ttft_ms
-            )
-        if record.engine_tpot_ms is not None:
-            trace_state.set_attribute(
-                trace_attrs.RTP_LLM_ENGINE_TIME_PER_OUTPUT_TOKEN_MS,
-                record.engine_tpot_ms,
-            )
         if record.status == "OK":
             trace_state.finish()
         else:
@@ -898,16 +887,9 @@ async def iter_real_model_stream_infer(
             prompt_cached_token_num = (
                 int(aux_info.reuse_len) if aux_info is not None else 0
             )
-            if access_agg is not None and aux_info is not None:
-                access_agg.record_engine_token_latency(
-                    phase="phase1",
-                    cost_time_ms=aux_info.cost_time,
-                    first_token_cost_time_ms=aux_info.first_token_cost_time,
-                    output_len=aux_info.output_len,
-                )
-                if aux_info.role_addrs:
-                    # model_rpc_client copies the final submitted role_addrs here.
-                    access_agg.record_role_addrs(aux_info.role_addrs, phase="phase1")
+            if access_agg is not None and aux_info is not None and aux_info.role_addrs:
+                # model_rpc_client copies the final submitted role_addrs here.
+                access_agg.record_role_addrs(aux_info.role_addrs, phase="phase1")
             if not generated_ids and not out_py.finished:
                 continue
             ids_for_accounting = generated_ids
@@ -1363,18 +1345,13 @@ async def iter_real_model_stream_infer(
                 prompt_cached_token_num = (
                     int(aux_info.reuse_len) if aux_info is not None else 0
                 )
-                if access_agg is not None and aux_info is not None:
-                    access_agg.record_engine_token_latency(
-                        phase="phase2",
-                        cost_time_ms=aux_info.cost_time,
-                        first_token_cost_time_ms=aux_info.first_token_cost_time,
-                        output_len=aux_info.output_len,
-                    )
-                    if aux_info.role_addrs:
-                        # model_rpc_client copies the final submitted role_addrs here.
-                        access_agg.record_role_addrs(
-                            aux_info.role_addrs, phase="phase2"
-                        )
+                if (
+                    access_agg is not None
+                    and aux_info is not None
+                    and aux_info.role_addrs
+                ):
+                    # model_rpc_client copies the final submitted role_addrs here.
+                    access_agg.record_role_addrs(aux_info.role_addrs, phase="phase2")
                 response = build_stream_response_from_generate_outputs(
                     dash_sc_request_id=f"{request.id}{_PHASE2_SUFFIX}",
                     model_name=request.model_name,
@@ -1945,6 +1922,10 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                             enabled=bool(sampling.return_logprobs),
                             finished=bool(finished),
                         )
+                        if trace_state is not None and generated_ids_for_log:
+                            trace_state.record_frontend_output_tokens(
+                                len(generated_ids_for_log)
+                            )
                         yield resp
                 finally:
                     await response_iter.aclose()

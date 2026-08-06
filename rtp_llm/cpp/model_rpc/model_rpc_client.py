@@ -2,6 +2,7 @@ import asyncio
 import functools
 import json
 import logging
+import math
 from typing import Any, AsyncGenerator, Optional
 
 import grpc
@@ -113,6 +114,64 @@ def _record_client_span_usage(
         client_span.set_attribute("gen_ai.usage.completion_tokens", output_len)
         client_span.set_attribute("gen_ai.usage.total_tokens", input_len + output_len)
     except Exception:
+        pass
+
+
+def _record_client_span_latency(
+    client_span: Any, outputs: Optional[GenerateOutputs]
+) -> None:
+    """Writes Engine TTFT/TPOT on one physical engine CLIENT span.
+
+    Multi-return (n>1) is served by a single physical stream, so every sequence
+    shares the prefill that commits the first token: Engine TTFT is written only
+    when all sequences agree on it. The per-token decode interval, by contrast,
+    is per-sequence and has no unambiguous stream-level value, so Engine TPOT is
+    restricted to single-sequence streams instead of silently publishing
+    sequence 0 as if it described the whole span.
+    """
+    if client_span is None:
+        return
+    try:
+        generate_outputs = outputs.generate_outputs if outputs is not None else []
+        if not generate_outputs:
+            return
+        aux_infos = [out.aux_info for out in generate_outputs]
+        if any(
+            not isinstance(aux.output_len, int)
+            or isinstance(aux.output_len, bool)
+            or aux.output_len <= 0
+            for aux in aux_infos
+        ):
+            return
+        ttft_ms = aux_infos[0].first_token_cost_time
+        if (
+            not isinstance(ttft_ms, (int, float))
+            or isinstance(ttft_ms, bool)
+            or not math.isfinite(float(ttft_ms))
+            or ttft_ms <= 0
+            or any(aux.first_token_cost_time != ttft_ms for aux in aux_infos)
+        ):
+            return
+        client_span.set_attribute(
+            trace_attrs.RTP_LLM_ENGINE_TIME_TO_FIRST_TOKEN_MS, float(ttft_ms)
+        )
+
+        if len(aux_infos) != 1:
+            return
+        output_len = aux_infos[0].output_len
+        cost_ms = aux_infos[0].cost_time
+        if (
+            output_len > 1
+            and isinstance(cost_ms, (int, float))
+            and not isinstance(cost_ms, bool)
+            and math.isfinite(float(cost_ms))
+            and cost_ms >= ttft_ms
+        ):
+            client_span.set_attribute(
+                trace_attrs.RTP_LLM_ENGINE_TIME_PER_OUTPUT_TOKEN_MS,
+                float(cost_ms - ttft_ms) / (output_len - 1),
+            )
+    except Exception:  # noqa: BLE001 - fail-open
         pass
 
 
@@ -720,6 +779,7 @@ class ModelRpcClient(object):
             if client_span is not None:
                 _record_client_rpc_status(client_span, rpc_status)
                 _record_client_span_usage(client_span, last_output)
+                _record_client_span_latency(client_span, last_output)
                 client_span.finish(error=e, error_type="RpcError")
             # TODO(xinfei.sxf) 非流式的请求无法取消了
             if response_iterator:
@@ -773,6 +833,7 @@ class ModelRpcClient(object):
                 _record_client_rpc_status(client_span, rpc_status)
             if client_span is not None:
                 _record_client_span_usage(client_span, last_output)
+                _record_client_span_latency(client_span, last_output)
                 if engine_finished or _request_completed_normally(trace_state):
                     client_span.finish()
                 else:
@@ -786,6 +847,7 @@ class ModelRpcClient(object):
                 _record_client_rpc_status(client_span, rpc_status)
             if client_span is not None:
                 _record_client_span_usage(client_span, last_output)
+                _record_client_span_latency(client_span, last_output)
                 client_span.finish(error=e)
             logging.error(f"rpc unknown error:{str(e)}")
             raise e
@@ -795,6 +857,7 @@ class ModelRpcClient(object):
                     rpc_status = await _wait_for_rpc_termination(response_iterator)
                 _record_client_rpc_status(client_span, rpc_status)
                 _record_client_span_usage(client_span, last_output)
+                _record_client_span_latency(client_span, last_output)
                 client_span.finish()
             if response_iterator:
                 response_iterator.cancel()
