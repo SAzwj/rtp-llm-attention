@@ -13,7 +13,7 @@ import os
 import struct
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import grpc
 

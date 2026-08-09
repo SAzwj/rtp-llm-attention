@@ -1181,7 +1181,7 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
             req,
             [7, 8, 128821],
             SamplingParams(),
-            DashScRequestControls(enable_thinking=True),
+            OtherParams(enable_thinking=True),
             visitor,
             rtp_llm_request_id=100,
             echo_prefix_ids=[128821, 198],
@@ -3465,7 +3465,7 @@ class DashScInferenceTracingTest(unittest.IsolatedAsyncioTestCase):
         span = self._finished_spans()[-1]
         self.assertEqual(span.name, "dash_sc.ModelStreamInfer")
         self.assertEqual(span.status.status_code.name, "ERROR")
-        self.assertEqual(span.attributes["error.type"], "DASH_ERROR_19")
+        self.assertEqual(span.attributes["error.type"], "BACKEND_RuntimeError")
 
     async def test_prologue_reporting_failure_still_ends_server_span(self) -> None:
         """A throwing arrival metric must not leak the SERVER span.

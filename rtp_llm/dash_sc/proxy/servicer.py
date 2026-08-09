@@ -433,6 +433,8 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     await buffered.aclose()
                 except Exception:
                     pass
+        except grpc.aio.AioRpcError as e:
+            await _abort_with_downstream_grpc_error(context, e, addr)
         finally:
             # Safety net. ``_close_downstream`` is also exposed as a public-ish
             # static method so any future code path that wants to tear down

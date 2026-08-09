@@ -170,6 +170,9 @@ build:cuda13 --host_action_env TF_CUDA_COMPUTE_CAPABILITIES="8.0,8.6,8.9,9.0,10.
 build:cuda13 --copt="-DENABLE_FP4=1"
 build:cuda13 --copt=-Wno-missing-field-initializers
 build:cuda13 --copt=-Wno-error=missing-field-initializers
+# GCC 12 diagnoses Torch 2.11's cache-line alignment constant as ABI-sensitive.
+# It comes from a third-party header and must not fail CUDA 13 x86 builds under -Werror.
+build:cuda13 --cxxopt=-Wno-interference-size
 build:cuda13 --host_copt=-Wno-missing-field-initializers
 build:cuda13_arm --host_copt=-Wno-error=missing-field-initializers
 # Triton 3.6.0 (shipped with cuda13 lock) supports CUDA 13.x ptxas natively;

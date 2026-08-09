@@ -18,7 +18,7 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Callable, Iterator, Optional
+from typing import Any, AsyncIterator, Callable, Iterable, Iterator, Optional
 
 import torch
 

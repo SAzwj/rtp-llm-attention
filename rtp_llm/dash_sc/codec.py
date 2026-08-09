@@ -30,9 +30,7 @@ from rtp_llm.utils.base_model_datatypes import GenerateOutputs
 
 _DEFAULT_MAX_THINKING_TOKENS = 131072
 _DEFAULT_MAX_NEW_TOKENS = 131072
-_PACK_EOS_FOR_EMPTY_GENERATED_IDS_ENV = (
-    "DASH_SC_PACK_EOS_FOR_EMPTY_GENERATED_IDS"
-)
+_PACK_EOS_FOR_EMPTY_GENERATED_IDS_ENV = "DASH_SC_PACK_EOS_FOR_EMPTY_GENERATED_IDS"
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
@@ -41,6 +39,7 @@ def _pack_eos_for_empty_generated_ids() -> bool:
         os.environ.get(_PACK_EOS_FOR_EMPTY_GENERATED_IDS_ENV, "").strip().lower()
         in _TRUE_ENV_VALUES
     )
+
 
 FINISH_REASON_LENGTH = 1
 FINISH_REASON_STOP_ENGINE_PARAM = 8
@@ -2166,6 +2165,7 @@ def build_error_response(
     )
     _append_finished_output(infer, finished=True)
     infer.parameters["incremental_output"].int64_param = 1
+    infer.parameters["error_no"].int64_param = FINISH_REASON_STOP_ENGINE_PARAM
     infer.parameters["status_code"].int64_param = int(status_code)
     infer.parameters["status_name"].string_param = status_name
     infer.parameters["status_message"].string_param = message
