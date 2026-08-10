@@ -871,6 +871,8 @@ class ProxyTracingTest(unittest.IsolatedAsyncioTestCase):
     async def test_server_client_boundary_reinjects_client_parent(self) -> None:
         trace_id_hex = "55555555555555555555555555555555"
         parent_span_hex = "6666666666666666"
+        body_trace_id_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        body_parent_span_hex = "bbbbbbbbbbbbbbbb"
         context = MagicMock()
         context.invocation_metadata.return_value = (
             (
@@ -878,33 +880,48 @@ class ProxyTracingTest(unittest.IsolatedAsyncioTestCase):
                 f"00-{trace_id_hex}-{parent_span_hex}-01",
             ),
             ("tracestate", "upstream=one"),
+            ("x-dashscope-request-id", "dashscope-correlation"),
             ("x-request-id", "correlation"),
         )
         context.code.return_value = None
         context.is_active.return_value = True
         context.details.return_value = ""
         context.peer.return_value = "ipv4:127.0.0.1:9000"
-        self.mock_stub.ModelStreamInfer.return_value = _AsyncIter(
-            [_make_finished_response()]
+        forwarded_requests = []
+
+        def downstream(request_iterator, *, metadata):
+            async def response_stream():
+                async for request in request_iterator:
+                    forwarded_requests.append(request)
+                yield _make_finished_response()
+
+            return response_stream()
+
+        self.mock_stub.ModelStreamInfer.side_effect = downstream
+        request = _make_request(id="proxy-request")
+        request.parameters["traceparent"].string_param = (
+            f"00-{body_trace_id_hex}-{body_parent_span_hex}-01"
         )
+        request.parameters["tracestate"].string_param = "body=one"
+        request.parameters["baggage"].string_param = "traffic.llm_sdk.scene=chat"
 
         responses = await _drain(
-            self.servicer.ModelStreamInfer(
-                _request_gen(_make_request(id="proxy-request")), context
-            )
+            self.servicer.ModelStreamInfer(_request_gen(request), context)
         )
 
         self.assertEqual(len(responses), 1)
         spans = {span.name: span for span in self._finished_spans()}
         server = spans["dash_sc.proxy.ModelStreamInfer"]
         client = spans["dash_sc.proxy.forward"]
-        self.assertEqual(server.context.trace_id, int(trace_id_hex, 16))
-        self.assertEqual(server.parent.span_id, int(parent_span_hex, 16))
+        self.assertEqual(server.context.trace_id, int(body_trace_id_hex, 16))
+        self.assertEqual(server.parent.span_id, int(body_parent_span_hex, 16))
         self.assertEqual(client.parent.span_id, server.context.span_id)
+        self.assertEqual(server.attributes["rtp_llm.trace_context_source"], "body")
         self.assertEqual(server.status.status_code.name, "OK")
         self.assertEqual(client.status.status_code.name, "OK")
         self.assertEqual(
-            server.attributes["rtp_llm.external_request_id"], "proxy-request"
+            server.attributes["rtp_llm.external_request_id"],
+            "dashscope-correlation",
         )
         self.assertNotIn("request_id", server.attributes)
         self.assertNotIn("rtp_llm.request_id", server.attributes)
@@ -935,7 +952,8 @@ class ProxyTracingTest(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(forbidden, client.attributes)
         self.assertEqual(
-            client.attributes["rtp_llm.external_request_id"], "proxy-request"
+            client.attributes["rtp_llm.external_request_id"],
+            "dashscope-correlation",
         )
         self.assertNotIn("request_id", client.attributes)
 
@@ -949,6 +967,9 @@ class ProxyTracingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             f"-{client.context.span_id:016x}-", forwarded_headers["traceparent"]
         )
+        self.assertEqual(len(forwarded_requests), 1)
+        for key in ("traceparent", "tracestate", "baggage"):
+            self.assertNotIn(key, forwarded_requests[0].parameters)
 
     async def test_downstream_abort_preserves_grpc_status_on_proxy_spans(self) -> None:
         context = MagicMock()

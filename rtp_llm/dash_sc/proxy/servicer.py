@@ -8,12 +8,18 @@ or async generator so the whole proxy path stays on a single asyncio event loop.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import grpc
 
 from rtp_llm.dash_sc.access_log import emit_access_log, emit_query_log
-from rtp_llm.dash_sc.access_record import GrpcAccessRecord, to_optional_int
+from rtp_llm.dash_sc.access_record import (
+    GrpcAccessRecord,
+    extract_body_trace_headers,
+    extract_span_external_request_id,
+    to_optional_int,
+)
 from rtp_llm.dash_sc.codec import (
     build_parameter_error_response,
     parse_max_new_tokens_for_proxy,
@@ -46,15 +52,6 @@ _DASH_SERVER_ATTRIBUTES = {
     "rpc.system": "grpc",
     "rpc.method": _DASH_RPC_METHOD,
 }
-# The forwarder relays the client's own request id. Cap it so a buggy or hostile
-# caller cannot add an unbounded high-cardinality value to the trace. This must
-# not use the platform-indexed request_id key: that key represents the generated
-# engine request and creates a model-topology node in Unitrace.
-_MAX_SPAN_REQUEST_ID_LEN = 128
-
-
-def _span_request_id(raw_id: object) -> str:
-    return str(raw_id)[:_MAX_SPAN_REQUEST_ID_LEN]
 
 
 def _is_stream_done(resp: predict_v2_pb2.ModelStreamInferResponse) -> bool:
@@ -91,6 +88,23 @@ def _merge_trace_metadata(upstream_metadata, trace_metadata):
             merged.append((key, value))
     merged.extend(trace_metadata)
     return tuple(merged)
+
+
+def _without_body_trace_context(
+    request: predict_v2_pb2.ModelInferRequest,
+) -> predict_v2_pb2.ModelInferRequest:
+    """Copies a request without the upstream body carrier.
+
+    Once the proxy creates a CLIENT span, its injected metadata is the only
+    valid parent for the downstream SERVER span. Leaving the original body
+    carrier in place would let body precedence bypass that CLIENT hop.
+    """
+    forwarded = predict_v2_pb2.ModelInferRequest()
+    forwarded.CopyFrom(request)
+    for key in ("traceparent", "tracestate", "baggage"):
+        if key in forwarded.parameters:
+            del forwarded.parameters[key]
+    return forwarded
 
 
 def _finish_proxy_traces(server_state, client_span, record, exc) -> None:
@@ -200,30 +214,52 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         )
 
     async def ModelStreamInfer(self, request_iterator, context):
+        request_start_time = time.time_ns()
+        request_start_ns = time.monotonic_ns()
         try:
             invocation_metadata = context.invocation_metadata() or ()
         except Exception:
             invocation_metadata = ()
+        metadata_headers = metadata_to_headers(invocation_metadata)
         client_span = None
         # Self-managed access-log lifecycle (the shared interceptor is gone).
         # Create/arrival/query go first — before any inbound frame — so a
         # frame-less RPC (peer closed before sending) still reports arrival and
         # produces an access line via the ``finally`` below.
-        # The record is built before the SERVER span and the two reporting calls
-        # sit inside the ``try``: nothing that can raise runs between span start
-        # and ``try``, so the span can never escape without ``finally`` ending it
-        # and clearing CURRENT_TRACE_STATE.
+        # The SERVER span waits for the first frame so body trace context can
+        # override metadata. The finally block supplies metadata/root context
+        # for frame-less and prologue-failure paths and always ends the span.
         record = GrpcAccessRecord.create(
             context,
             "ModelStreamInfer",
             "bidi_stream",
             raw_mode=True,
         )
-        server_state = start_server_span(
-            _DASH_PROXY_SERVER_SPAN_NAME,
-            metadata_to_headers(invocation_metadata),
-            _DASH_SERVER_ATTRIBUTES,
-        )
+        server_state = None
+
+        def _ensure_server_span(body_headers: Optional[dict[str, str]] = None):
+            nonlocal server_state
+            if server_state is not None:
+                return server_state
+            headers = dict(metadata_headers)
+            if body_headers:
+                headers.update(body_headers)
+            source = (
+                "body"
+                if body_headers and body_headers.get("traceparent")
+                else "metadata" if metadata_headers.get("traceparent") else "none"
+            )
+            server_state = start_server_span(
+                _DASH_PROXY_SERVER_SPAN_NAME,
+                headers,
+                _DASH_SERVER_ATTRIBUTES,
+                start_time=request_start_time,
+                request_start_ns=request_start_ns,
+            )
+            if server_state is not None:
+                server_state.set_attribute("rtp_llm.trace_context_source", source)
+            return server_state
+
         exc: Optional[BaseException] = None
         try:
             emit_query_log(record, rank_id=self._rank_id, server_id=self._server_id)
@@ -235,11 +271,15 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                 record.mark_request_done("eof")
                 return
             record.req_count = 1
+            _ensure_server_span(extract_body_trace_headers(first_request))
+            external_request_id = extract_span_external_request_id(
+                invocation_metadata, first_request
+            )
             record.record_request_frame(first_request)
             if server_state is not None:
                 server_state.set_attribute(
                     trace_attrs.RTP_LLM_EXTERNAL_REQUEST_ID,
-                    _span_request_id(first_request.id),
+                    external_request_id,
                 )
 
             invalid_message = _invalid_max_new_tokens_message(first_request)
@@ -306,11 +346,13 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                 # gen_ai.* either because this hop does not invoke a model.
                 client_span.set_attribute(
                     trace_attrs.RTP_LLM_EXTERNAL_REQUEST_ID,
-                    _span_request_id(first_request.id),
+                    external_request_id,
                 )
             downstream_metadata = _merge_trace_metadata(
                 invocation_metadata, trace_metadata
             )
+            if trace_metadata:
+                first_request = _without_body_trace_context(first_request)
             async for resp in self._forward(
                 stub,
                 grpc_target,
@@ -335,6 +377,7 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                 )
             raise
         finally:
+            _ensure_server_span()
             status_exc = _status_exception_for_proxy(record, exc)
             end_ts = record.resolve_status(context, status_exc)
             try:

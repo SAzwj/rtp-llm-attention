@@ -13,6 +13,7 @@ the functional suite into an all-skip success.
 
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -355,6 +356,26 @@ class TestActiveRuntime(TracingTestCase):
             == "0af7651916cd43dd8448eb211c80319c"
         )
         assert format(spans[0].parent.span_id, "016x") == "b7ad6b7169203331"
+
+    def test_server_span_accepts_explicit_start_time(self):
+        exporter = _start_in_memory_runtime()
+        start_time = time.time_ns() - 1_000_000
+        request_start_ns = 1_000_000_000
+        state = tracing.start_server_span(
+            "delayed",
+            {},
+            start_time=start_time,
+            request_start_ns=request_start_ns,
+        )
+        assert state is not None
+        state.record_frontend_output_tokens(1, request_start_ns + 12_500_000)
+        state.finish()
+        tracing.shutdown_telemetry()
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].start_time == start_time
+        assert spans[0].attributes[attrs.GEN_AI_TIME_TO_FIRST_TOKEN] == 12.5
 
     def test_untrusted_unsampled_remote_parent_uses_local_sampler(self):
         exporter = _start_in_memory_runtime()

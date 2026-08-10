@@ -3283,20 +3283,42 @@ class DashScInferenceTracingTest(unittest.IsolatedAsyncioTestCase):
             return self._stream_factory()
 
     async def test_upstream_parent_server_client_and_attributes(self) -> None:
-        trace_id_hex = "11111111111111111111111111111111"
-        parent_span_hex = "2222222222222222"
+        metadata_trace_id_hex = "11111111111111111111111111111111"
+        metadata_parent_span_hex = "2222222222222222"
+        body_trace_id_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        body_parent_span_hex = "bbbbbbbbbbbbbbbb"
         metadata = (
-            ("traceparent", f"00-{trace_id_hex}-{parent_span_hex}-01"),
+            (
+                "traceparent",
+                f"00-{metadata_trace_id_hex}-{metadata_parent_span_hex}-01",
+            ),
             ("tracestate", "dash=test"),
+            ("x-request-id", "metadata-request"),
         )
         visitor = self._ClientSpanVisitor(self._terminal_stream)
         servicer = DashScInferenceServicer(
             backend_visitor=visitor, ip="127.0.0.1", port=18096, server_id="7"
         )
 
+        request = self._request("upstream")
+        request.parameters["traceparent"].string_param = (
+            f"00-{body_trace_id_hex}-{body_parent_span_hex}-01"
+        )
+        request.parameters["tracestate"].string_param = "bailian=e2e"
+        request.parameters["baggage"].string_param = (
+            "traffic.llm_sdk.scene=chat,test.test=1"
+        )
+        request.parameters["ds_header_attributes"].string_param = json.dumps(
+            {
+                "traceparent": "00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01",
+                "traceparent_new": f"00-{body_trace_id_hex}-{body_parent_span_hex}-01",
+                "x-dashscope-requestid": "body-dashscope-request",
+            }
+        )
+
         responses = await _drain(
             servicer.ModelStreamInfer(
-                _areq_iter([self._request("upstream")]),
+                _areq_iter([request]),
                 _FakeGrpcContext(metadata),
             )
         )
@@ -3305,9 +3327,15 @@ class DashScInferenceTracingTest(unittest.IsolatedAsyncioTestCase):
         spans = {span.name: span for span in self._finished_spans()}
         server = spans["dash_sc.ModelStreamInfer"]
         client = spans["rtp_llm.generate_stream_call"]
-        self.assertEqual(server.context.trace_id, int(trace_id_hex, 16))
-        self.assertEqual(server.parent.span_id, int(parent_span_hex, 16))
+        self.assertEqual(server.context.trace_id, int(body_trace_id_hex, 16))
+        self.assertEqual(server.parent.span_id, int(body_parent_span_hex, 16))
         self.assertEqual(client.parent.span_id, server.context.span_id)
+        self.assertEqual(server.attributes["rtp_llm.trace_context_source"], "body")
+        self.assertEqual(server.attributes["scene"], "chat")
+        self.assertNotIn("test.test", server.attributes)
+        self.assertEqual(
+            server.attributes["rtp_llm.external_request_id"], "metadata-request"
+        )
         self.assertEqual(server.attributes["gen_ai.span.kind"], "LLM")
         self.assertEqual(server.attributes["gen_ai.operation.name"], "chat")
         self.assertEqual(server.attributes["gen_ai.system"], "rtp_llm")
@@ -3361,6 +3389,7 @@ class DashScInferenceTracingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(local_root.name, "dash_sc.ModelStreamInfer")
         self.assertIsNone(local_root.parent)
         self.assertEqual(local_root.status.status_code.name, "OK")
+        self.assertEqual(local_root.attributes["rtp_llm.trace_context_source"], "none")
 
         bad = predict_v2_pb2.ModelInferRequest(id="bad", model_name="default")
         await _drain(servicer.ModelStreamInfer(_areq_iter([bad]), _FakeGrpcContext()))
@@ -3371,7 +3400,95 @@ class DashScInferenceTracingTest(unittest.IsolatedAsyncioTestCase):
         await _drain(servicer.ModelStreamInfer(_areq_iter([]), _FakeGrpcContext()))
         no_frame = self._finished_spans()[-1]
         self.assertEqual(no_frame.status.status_code.name, "OK")
+        self.assertEqual(no_frame.attributes["rtp_llm.trace_context_source"], "none")
         self.assertNotIn("request_id", no_frame.attributes)
+
+    async def test_parser_error_preserves_body_parent(self) -> None:
+        metadata_trace_id_hex = "11111111111111111111111111111111"
+        body_trace_id_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        body_parent_span_hex = "bbbbbbbbbbbbbbbb"
+        request = self._request("bad-with-body-parent")
+        request.parameters["traceparent"].string_param = (
+            f"00-{body_trace_id_hex}-{body_parent_span_hex}-01"
+        )
+        servicer = DashScInferenceServicer(
+            backend_visitor=self._ClientSpanVisitor(self._terminal_stream)
+        )
+
+        with patch(
+            "rtp_llm.dash_sc.inference.servicer.parse_dash_sc_grpc_request",
+            side_effect=DashScParameterError("bad parameter"),
+        ):
+            responses = await _drain(
+                servicer.ModelStreamInfer(
+                    _areq_iter([request]),
+                    _FakeGrpcContext(
+                        (
+                            (
+                                "traceparent",
+                                f"00-{metadata_trace_id_hex}-2222222222222222-01",
+                            ),
+                        )
+                    ),
+                )
+            )
+
+        self.assertEqual(len(responses), 1)
+        span = self._finished_spans()[-1]
+        self.assertEqual(span.context.trace_id, int(body_trace_id_hex, 16))
+        self.assertEqual(span.parent.span_id, int(body_parent_span_hex, 16))
+        self.assertEqual(span.attributes["rtp_llm.trace_context_source"], "body")
+        self.assertEqual(span.status.status_code.name, "ERROR")
+
+    async def test_metadata_parent_and_external_request_id_fallbacks(self) -> None:
+        trace_id_hex = "33333333333333333333333333333333"
+        parent_span_hex = "4444444444444444"
+        servicer = DashScInferenceServicer(
+            backend_visitor=self._ClientSpanVisitor(self._terminal_stream)
+        )
+
+        request = self._request("body-request-id")
+        request.parameters["ds_header_attributes"].string_param = json.dumps(
+            {"x-dashscope-requestid": "body-dashscope-request"}
+        )
+        await _drain(
+            servicer.ModelStreamInfer(
+                _areq_iter([request]),
+                _FakeGrpcContext(
+                    (("traceparent", f"00-{trace_id_hex}-{parent_span_hex}-01"),)
+                ),
+            )
+        )
+        span = self._finished_spans()[-1]
+        self.assertEqual(span.context.trace_id, int(trace_id_hex, 16))
+        self.assertEqual(span.parent.span_id, int(parent_span_hex, 16))
+        self.assertEqual(span.attributes["rtp_llm.trace_context_source"], "metadata")
+        self.assertEqual(
+            span.attributes["rtp_llm.external_request_id"],
+            "body-dashscope-request",
+        )
+
+        body_id_request = self._request("body-request-id")
+        await _drain(
+            servicer.ModelStreamInfer(_areq_iter([body_id_request]), _FakeGrpcContext())
+        )
+        body_id_span = self._finished_spans()[-1]
+        self.assertEqual(
+            body_id_span.attributes["rtp_llm.external_request_id"],
+            "body-request-id",
+        )
+
+        trace_only_request = self._request("")
+        await _drain(
+            servicer.ModelStreamInfer(
+                _areq_iter([trace_only_request]),
+                _FakeGrpcContext(
+                    (("traceparent", f"00-{trace_id_hex}-{parent_span_hex}-01"),)
+                ),
+            )
+        )
+        trace_only_span = self._finished_spans()[-1]
+        self.assertNotIn("rtp_llm.external_request_id", trace_only_span.attributes)
 
     async def test_cancelled_stream_sets_cancelled_status(self) -> None:
         class _CancelVisitor:

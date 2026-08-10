@@ -1014,6 +1014,8 @@ def start_server_span(
     span_name: str,
     headers: Any,
     initial_attributes: Optional[Dict[str, Any]] = None,
+    start_time: Optional[int] = None,
+    request_start_ns: Optional[int] = None,
 ) -> Optional[RequestTraceState]:
     """Starts an HTTP SERVER span with remote parent extracted from headers.
 
@@ -1027,12 +1029,15 @@ def start_server_span(
         if tracer is None:
             return None
         remote_context = extract_context_from_headers(headers)
-        request_start_ns = time.monotonic_ns()
+        monotonic_start_ns = (
+            request_start_ns if request_start_ns is not None else time.monotonic_ns()
+        )
         span = tracer.start_span(
             span_name,
             context=remote_context,
             kind=trace.SpanKind.SERVER,
             attributes=dict(initial_attributes) if initial_attributes else None,
+            start_time=start_time,
         )
         for baggage_key, baggage_value in _extract_llm_sdk_baggage(headers).items():
             try:
@@ -1043,7 +1048,7 @@ def start_server_span(
         state = RequestTraceState(
             server_span=span,
             server_context=server_context,
-            request_start_ns=request_start_ns,
+            request_start_ns=monotonic_start_ns,
         )
         CURRENT_TRACE_STATE.set(state)
         return state
