@@ -578,6 +578,38 @@ def extract_context_from_headers(headers: Any) -> Optional[Any]:
         return None
 
 
+def select_valid_server_trace_carrier(
+    body_headers: Any, metadata_headers: Any
+) -> Tuple[Dict[str, str], str]:
+    """Select one complete valid W3C carrier without mixing its sources."""
+    if not OTEL_AVAILABLE:
+        return {}, "none"
+    for source, headers in (("body", body_headers), ("metadata", metadata_headers)):
+        if not hasattr(headers, "get"):
+            continue
+        carrier = {
+            key: str(value)
+            for key in ("traceparent", "tracestate", "baggage")
+            if (value := headers.get(key))
+        }
+        if "traceparent" not in carrier:
+            continue
+        try:
+            context = TraceContextTextMapPropagator().extract(
+                {
+                    key: carrier[key]
+                    for key in ("traceparent", "tracestate")
+                    if key in carrier
+                },
+                context=otel_context.Context(),
+            )
+            if trace.get_current_span(context).get_span_context().is_valid:
+                return carrier, source
+        except Exception:  # noqa: BLE001 - malformed carriers are ignored
+            continue
+    return {}, "none"
+
+
 def metadata_to_headers(metadata: Any) -> Dict[str, Any]:
     """Converts gRPC metadata to a lowercase, mapping-like carrier.
 

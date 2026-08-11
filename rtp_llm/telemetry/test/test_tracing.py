@@ -612,6 +612,23 @@ class TestClientSpan(TracingTestCase):
         assert format(client.context.span_id, "016x") in carrier["traceparent"]
         assert format(client.context.trace_id, "032x") in carrier["traceparent"]
 
+    def test_zero_ratio_still_propagates_non_recording_client_context(self):
+        os.environ["RTP_LLM_OTEL_TRACE_SAMPLER_RATIO"] = "0"
+        exporter = _start_in_memory_runtime()
+        trace_id = "0af7651916cd43dd8448eb211c80319c"
+        state = tracing.start_server_span(
+            "server",
+            {"traceparent": f"00-{trace_id}-b7ad6b7169203331-01"},
+        )
+        handle, metadata = tracing.start_client_span("client")
+        assert handle is not None
+        carrier = dict(metadata)
+        assert carrier["traceparent"].split("-")[1] == trace_id
+        handle.finish()
+        state.finish()
+        tracing.shutdown_telemetry()
+        assert exporter.get_finished_spans() == ()
+
     def test_client_span_omits_rpc_system(self):
         # rpc.system on the frontend CLIENT span made the platform re-classify
         # it as an RPC client call, breaking the top-bar Total tokens

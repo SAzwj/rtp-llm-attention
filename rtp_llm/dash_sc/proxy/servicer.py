@@ -34,7 +34,10 @@ from rtp_llm.dash_sc.proxy.service_route import create_service_discovery_from_en
 from rtp_llm.telemetry import CURRENT_TRACE_STATE
 from rtp_llm.telemetry import attributes as trace_attrs
 from rtp_llm.telemetry import start_client_span, start_server_span
-from rtp_llm.telemetry.tracing import metadata_to_headers
+from rtp_llm.telemetry.tracing import (
+    metadata_to_headers,
+    select_valid_server_trace_carrier,
+)
 from rtp_llm.utils.grpc_host_channel_pool import GrpcHostChannelPool
 
 _FORWARD_CHANNEL_OPTS: list[tuple[str, int]] = [
@@ -44,7 +47,8 @@ _FORWARD_CHANNEL_OPTS: list[tuple[str, int]] = [
     ("grpc.http2.max_pings_without_data", 0),
 ]
 _CHANNEL_CLEANUP_INTERVAL_S = 60
-_TRACE_METADATA_KEYS = frozenset({"traceparent", "tracestate"})
+_TRACE_METADATA_KEYS = frozenset({"traceparent", "tracestate", "baggage"})
+_BODY_TRACE_PARAMETER_KEYS = ("traceparent", "tracestate", "baggage")
 _DASH_RPC_METHOD = "GRPCInferenceService/ModelStreamInfer"
 _DASH_PROXY_SERVER_SPAN_NAME = "dash_sc.proxy.ModelStreamInfer"
 _DASH_PROXY_CLIENT_SPAN_NAME = "dash_sc.proxy.forward"
@@ -76,8 +80,7 @@ def _invalid_max_new_tokens_message(request) -> str | None:
 def _merge_trace_metadata(upstream_metadata, trace_metadata):
     """Preserves application metadata while replacing the W3C trace carrier."""
     upstream = tuple(upstream_metadata or ())
-    if not trace_metadata:
-        return upstream
+    replaced_keys = _TRACE_METADATA_KEYS if trace_metadata else frozenset({"baggage"})
     merged = []
     for entry in upstream:
         try:
@@ -90,20 +93,20 @@ def _merge_trace_metadata(upstream_metadata, trace_metadata):
     return tuple(merged)
 
 
-def _without_body_trace_context(
-    request: predict_v2_pb2.ModelInferRequest,
-) -> predict_v2_pb2.ModelInferRequest:
-    """Copies a request without the upstream body carrier.
-
-    Once the proxy creates a CLIENT span, its injected metadata is the only
-    valid parent for the downstream SERVER span. Leaving the original body
-    carrier in place would let body precedence bypass that CLIENT hop.
-    """
+def _strip_body_trace_carrier(request):
+    keys = [
+        key
+        for key in _BODY_TRACE_PARAMETER_KEYS
+        if key in request.parameters
+        and request.parameters[key].HasField("string_param")
+        and request.parameters[key].string_param
+    ]
+    if not keys:
+        return request
     forwarded = predict_v2_pb2.ModelInferRequest()
     forwarded.CopyFrom(request)
-    for key in ("traceparent", "tracestate", "baggage"):
-        if key in forwarded.parameters:
-            del forwarded.parameters[key]
+    for key in keys:
+        del forwarded.parameters[key]
     return forwarded
 
 
@@ -241,13 +244,8 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
             nonlocal server_state
             if server_state is not None:
                 return server_state
-            headers = dict(metadata_headers)
-            if body_headers:
-                headers.update(body_headers)
-            source = (
-                "body"
-                if body_headers and body_headers.get("traceparent")
-                else "metadata" if metadata_headers.get("traceparent") else "none"
+            headers, source = select_valid_server_trace_carrier(
+                body_headers or {}, metadata_headers
             )
             server_state = start_server_span(
                 _DASH_PROXY_SERVER_SPAN_NAME,
@@ -351,12 +349,16 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
             downstream_metadata = _merge_trace_metadata(
                 invocation_metadata, trace_metadata
             )
-            if trace_metadata:
-                first_request = _without_body_trace_context(first_request)
+            strip_body_carrier = bool(trace_metadata)
+
+            async def forwarded_request_iter():
+                async for req in validated_request_iter():
+                    yield _strip_body_trace_carrier(req) if strip_body_carrier else req
+
             async for resp in self._forward(
                 stub,
                 grpc_target,
-                validated_request_iter(),
+                forwarded_request_iter(),
                 context,
                 record,
                 downstream_metadata,

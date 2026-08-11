@@ -68,7 +68,10 @@ from rtp_llm.server.request_headers import (
     extract_trace_id,
 )
 from rtp_llm.telemetry import CURRENT_TRACE_STATE, start_server_span
-from rtp_llm.telemetry.tracing import metadata_to_headers
+from rtp_llm.telemetry.tracing import (
+    metadata_to_headers,
+    select_valid_server_trace_carrier,
+)
 from rtp_llm.utils.base_model_datatypes import GenerateInput, RequestInfo
 from rtp_llm.utils.util import AtomicCounter
 
@@ -1780,13 +1783,8 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
             nonlocal trace_state
             if trace_state is not None:
                 return trace_state
-            headers = dict(metadata_headers)
-            if body_headers:
-                headers.update(body_headers)
-            source = (
-                "body"
-                if body_headers and body_headers.get("traceparent")
-                else "metadata" if metadata_headers.get("traceparent") else "none"
+            headers, source = select_valid_server_trace_carrier(
+                body_headers or {}, metadata_headers
             )
             trace_state = start_server_span(
                 _DASH_SERVER_SPAN_NAME,
