@@ -331,6 +331,37 @@ class IteratorBehaviorTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(responses), 2)
 
+    async def test_closing_forwarded_iterator_marks_request_done(self) -> None:
+        context = MagicMock()
+        context.invocation_metadata.return_value = ()
+        context.code.return_value = None
+        context.is_active.return_value = True
+        context.details.return_value = ""
+        context.peer.return_value = "ipv4:127.0.0.1:9000"
+
+        def downstream(request_iterator, *, metadata):
+            async def response_stream():
+                await request_iterator.__anext__()
+                await request_iterator.aclose()
+                record = GrpcAccessRecord.from_context(context)
+                self.assertIsNotNone(record)
+                self.assertIsNotNone(record.request_end_ts)
+                self.assertEqual(record.request_read_status, "error")
+                yield _make_finished_response()
+
+            return response_stream()
+
+        self.mock_stub.ModelStreamInfer.side_effect = downstream
+
+        responses = await _drain(
+            self.servicer.ModelStreamInfer(
+                _request_gen(_make_request("req1"), _make_request("req2")),
+                context,
+            )
+        )
+
+        self.assertEqual(len(responses), 1)
+
 
 class ParameterValidationTest(unittest.IsolatedAsyncioTestCase):
     """Proxy rejects bad first-frame sampling params before forwarding."""
@@ -887,8 +918,6 @@ class ProxyTracingTest(unittest.IsolatedAsyncioTestCase):
     async def test_server_client_boundary_reinjects_client_parent(self) -> None:
         trace_id_hex = "55555555555555555555555555555555"
         parent_span_hex = "6666666666666666"
-        body_trace_id_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        body_parent_span_hex = "bbbbbbbbbbbbbbbb"
         context = MagicMock()
         context.invocation_metadata.return_value = (
             (
@@ -903,36 +932,24 @@ class ProxyTracingTest(unittest.IsolatedAsyncioTestCase):
         context.is_active.return_value = True
         context.details.return_value = ""
         context.peer.return_value = "ipv4:127.0.0.1:9000"
-        forwarded_requests = []
-
-        def downstream(request_iterator, *, metadata):
-            async def response_stream():
-                async for request in request_iterator:
-                    forwarded_requests.append(request)
-                yield _make_finished_response()
-
-            return response_stream()
-
-        self.mock_stub.ModelStreamInfer.side_effect = downstream
-        request = _make_request(id="proxy-request")
-        request.parameters["traceparent"].string_param = (
-            f"00-{body_trace_id_hex}-{body_parent_span_hex}-01"
+        self.mock_stub.ModelStreamInfer.return_value = _AsyncIter(
+            [_make_finished_response()]
         )
-        request.parameters["tracestate"].string_param = "body=one"
-        request.parameters["baggage"].string_param = "traffic.llm_sdk.scene=chat"
 
         responses = await _drain(
-            self.servicer.ModelStreamInfer(_request_gen(request), context)
+            self.servicer.ModelStreamInfer(
+                _request_gen(_make_request(id="proxy-request")), context
+            )
         )
 
         self.assertEqual(len(responses), 1)
         spans = {span.name: span for span in self._finished_spans()}
         server = spans["dash_sc.proxy.ModelStreamInfer"]
         client = spans["dash_sc.proxy.forward"]
-        self.assertEqual(server.context.trace_id, int(body_trace_id_hex, 16))
-        self.assertEqual(server.parent.span_id, int(body_parent_span_hex, 16))
+        self.assertEqual(server.context.trace_id, int(trace_id_hex, 16))
+        self.assertEqual(server.parent.span_id, int(parent_span_hex, 16))
         self.assertEqual(client.parent.span_id, server.context.span_id)
-        self.assertEqual(server.attributes["rtp_llm.trace_context_source"], "body")
+        self.assertEqual(server.attributes["rtp_llm.trace_context_source"], "metadata")
         self.assertEqual(server.status.status_code.name, "OK")
         self.assertEqual(client.status.status_code.name, "OK")
         self.assertEqual(
@@ -983,9 +1000,6 @@ class ProxyTracingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             f"-{client.context.span_id:016x}-", forwarded_headers["traceparent"]
         )
-        self.assertEqual(len(forwarded_requests), 1)
-        for key in ("traceparent", "tracestate", "baggage"):
-            self.assertNotIn(key, forwarded_requests[0].parameters)
 
     async def test_body_parent_reinjected_and_carriers_not_forwarded(self) -> None:
         metadata_trace_id = "11111111111111111111111111111111"

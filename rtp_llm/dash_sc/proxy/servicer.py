@@ -87,7 +87,7 @@ def _merge_trace_metadata(upstream_metadata, trace_metadata):
             key, value = entry
         except Exception:
             continue
-        if str(key).lower() not in _TRACE_METADATA_KEYS:
+        if str(key).lower() not in replaced_keys:
             merged.append((key, value))
     merged.extend(trace_metadata)
     return tuple(merged)
@@ -299,13 +299,23 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                 yield resp
                 return
 
+            strip_body_carrier = False
+
             async def validated_request_iter():
                 status = "eof"
                 try:
-                    yield first_request
+                    yield (
+                        _strip_body_trace_carrier(first_request)
+                        if strip_body_carrier
+                        else first_request
+                    )
                     async for req in request_iter:
                         record.req_count += 1
-                        yield req
+                        yield (
+                            _strip_body_trace_carrier(req)
+                            if strip_body_carrier
+                            else req
+                        )
                 except BaseException:
                     status = "error"
                     raise
@@ -350,15 +360,10 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                 invocation_metadata, trace_metadata
             )
             strip_body_carrier = bool(trace_metadata)
-
-            async def forwarded_request_iter():
-                async for req in validated_request_iter():
-                    yield _strip_body_trace_carrier(req) if strip_body_carrier else req
-
             async for resp in self._forward(
                 stub,
                 grpc_target,
-                forwarded_request_iter(),
+                validated_request_iter(),
                 context,
                 record,
                 downstream_metadata,

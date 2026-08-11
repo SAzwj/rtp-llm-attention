@@ -22,7 +22,10 @@ import torch
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.generate_config import GenerateConfig, RoleAddr
 from rtp_llm.dash_sc.access_log import DASH_SC_GRPC_ACCESS_LOGGER_NAME
-from rtp_llm.dash_sc.access_record import GrpcAccessRecord
+from rtp_llm.dash_sc.access_record import (
+    GrpcAccessRecord,
+    extract_span_external_request_id,
+)
 from rtp_llm.dash_sc.codec import DashScParameterError, OtherParams, SamplingParams
 from rtp_llm.dash_sc.inference.servicer import (
     DashScInferenceServicer,
