@@ -592,19 +592,29 @@ class _SpanAwareStub:
             def __init__(self):
                 self.cancelled = False
                 self.code_waited = False
+                self.code_resolved = False
                 self.events = []
+                self._terminal_status = None
+                self._terminal_ready = asyncio.Event()
 
             def __aiter__(self):
                 return self._gen()
 
             def cancel(self):
-                self.cancelled = True
                 self.events.append("cancel")
+                if self._terminal_ready.is_set():
+                    return False
+                self.cancelled = True
+                self._terminal_status = StatusCode.CANCELLED
+                self._terminal_ready.set()
+                return True
 
             async def code(self):
                 self.code_waited = True
                 self.events.append("code")
-                return StatusCode.CANCELLED if self.cancelled else StatusCode.OK
+                await self._terminal_ready.wait()
+                self.code_resolved = True
+                return self._terminal_status
 
             async def _gen(self):
                 for i in range(total):
@@ -620,9 +630,18 @@ class _SpanAwareStub:
                     aux_info.input_len = 8
                     aux_info.output_len = i + 1
                     output_pb.finished.extend([finish_last and i == total - 1])
+                    if finish_last and i == total - 1:
+                        # The real server can settle independently while the
+                        # Python message iterator remains suspended at yield.
+                        self._terminal_status = StatusCode.OK
+                        asyncio.get_running_loop().call_soon(self._terminal_ready.set)
                     yield outputs_pb
                 if terminal_error is not None:
+                    self._terminal_status = terminal_error.code()
+                    self._terminal_ready.set()
                     raise terminal_error
+                self._terminal_status = StatusCode.OK
+                self._terminal_ready.set()
 
         self.iterator = _Iterator()
         return self.iterator
@@ -825,7 +844,7 @@ class ClientSpanSettlementTest(TestCase):
         self.assertEqual(span.attributes, {})
 
     def test_consumer_break_after_finished_keeps_span_ok(self):
-        """The reproduced bug: renderer breaks, then GeneratorExit arrives."""
+        """The final frame is withheld until the physical RPC reaches OK."""
         span = _FakeClientSpan()
         client = self._build_client(span, total=3)
 
@@ -833,6 +852,8 @@ class ClientSpanSettlementTest(TestCase):
             gen = client.enqueue(self._make_input())
             async for outputs in gen:
                 if outputs.generate_outputs and outputs.generate_outputs[0].finished:
+                    self.assertTrue(client._test_stub.iterator.code_resolved)
+                    self.assertEqual(client._test_stub.iterator.events, ["code"])
                     break  # mirrors render_response_stream's _check_all_finished
             self.assertFalse(span.finished, "CLIENT must cover RPC termination")
             await gen.aclose()  # injects GeneratorExit at the suspended yield

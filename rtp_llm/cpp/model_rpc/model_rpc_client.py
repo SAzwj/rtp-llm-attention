@@ -773,6 +773,15 @@ class ModelRpcClient(object):
             async for response in response_iterator.__aiter__():
                 output_py = trans_output(input_py, response, stream_state)
                 last_output = output_py
+                if _engine_reported_finished(output_py):
+                    # The finished application frame is not the gRPC EOF. If it
+                    # escapes first, an upstream renderer can close this generator
+                    # while the server is still settling the RPC, converting a
+                    # naturally completed call into CANCELLED. grpc.aio receives
+                    # the terminal status independently of the message iterator,
+                    # so wait for that physical boundary before publishing the
+                    # final frame.
+                    rpc_status = await _wait_for_rpc_termination(response_iterator)
                 yield output_py
         except grpc.RpcError as e:
             rpc_status = e.code()
