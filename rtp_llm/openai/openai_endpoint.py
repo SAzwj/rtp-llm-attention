@@ -180,6 +180,22 @@ class OpenaiEndpoint(object):
     ) -> List[List[int]]:
         return [i for i, _ in itertools.groupby(sorted(stop_words_list))]
 
+    def _tokenize_request_stop_words(self, stop_words: List[str]) -> List[List[int]]:
+        stop_word_ids = []
+        for stop_word in stop_words:
+            # Byte-level tokenizers encode a word differently after a space.
+            variants = [stop_word]
+            if stop_word and not stop_word[0].isspace():
+                variants.append(" " + stop_word)
+            for variant in variants:
+                try:
+                    token_ids = self.tokenizer.encode(variant, add_special_tokens=False)
+                except TypeError:
+                    token_ids = self.tokenizer.encode(variant)
+                if token_ids:
+                    stop_word_ids.append(list(token_ids))
+        return stop_word_ids
+
     @staticmethod
     def _apply_json_format(config: GenerateConfig) -> None:
         config.json_format = True
@@ -252,16 +268,16 @@ class OpenaiEndpoint(object):
         request_stop_words_list = request.stop if request.stop != None else []
         if isinstance(request_stop_words_list, str):
             request_stop_words_list = [request_stop_words_list]
+        else:
+            request_stop_words_list = list(request_stop_words_list)
+        request_stop_words_list.extend(config.stop_words_str)
         config.stop_words_str = list(
-            set(
-                self.stop_words_str_list
-                + request_stop_words_list
-                + config.stop_words_str
-            )
+            set(self.stop_words_str_list + request_stop_words_list)
         )
         config.stop_words_list = self._dedup_stop_words_list(
             self.stop_words_id_list
-            + self.chat_renderer.tokenize_words(config.stop_words_str)
+            + self.chat_renderer.tokenize_words(self.stop_words_str_list)
+            + self._tokenize_request_stop_words(request_stop_words_list)
             + config.stop_words_list
         )
         if request.chat_id != None:

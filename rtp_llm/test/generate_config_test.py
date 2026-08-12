@@ -895,7 +895,9 @@ class OpenaiGenerateConfigTest(TestCase):
                 [151643],
                 [151645],
                 [2958, 2936, 3409],
+                [4232, 2936, 3409],
                 [41963, 4232, 2936, 3409],
+                [2441, 4232, 2936, 3409],
             ],
             req_stop=["req stop word", "another req stop word"],
         )
@@ -911,7 +913,9 @@ class OpenaiGenerateConfigTest(TestCase):
                 [151643],
                 [151645],
                 [2958, 2193, 2936, 3409],
+                [4232, 2193, 2936, 3409],
                 [41963, 2193, 4232, 2936, 3409],
+                [2441, 2193, 4232, 2936, 3409],
             ],
             req_config_stop_word_str=[
                 "req config stop word",
@@ -964,13 +968,18 @@ class OpenaiGenerateConfigTest(TestCase):
                 [3160, 2936, 1140],
                 [41963, 6105, 2936, 1140],  # env_stop_word_list
                 [2958, 2936, 3409],
+                [4232, 2936, 3409],
                 [41963, 4232, 2936, 3409],  # req_stop
+                [2441, 4232, 2936, 3409],
                 [2958, 2193, 2936, 3409],
+                [4232, 2193, 2936, 3409],
                 [41963, 2193, 4232, 2936, 3409],  # req_config_stop_word_str
+                [2441, 2193, 4232, 2936, 3409],
                 [2958, 2193, 2936, 1140],
                 [41963, 2193, 4232, 2936, 1140],  # req_config_stop_word_list
                 [21912, 2936, 1140],
                 [21912, 2936, 3409],  # duplicate stop word
+                [22737, 2936, 3409],
             ],
             model_stop_word_str=[
                 "model stop word",
