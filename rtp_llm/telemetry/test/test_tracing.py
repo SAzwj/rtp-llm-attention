@@ -360,22 +360,18 @@ class TestActiveRuntime(TracingTestCase):
     def test_server_span_accepts_explicit_start_time(self):
         exporter = _start_in_memory_runtime()
         start_time = time.time_ns() - 1_000_000
-        request_start_ns = 1_000_000_000
         state = tracing.start_server_span(
             "delayed",
             {},
             start_time=start_time,
-            request_start_ns=request_start_ns,
         )
         assert state is not None
-        state.record_frontend_output_tokens(1, request_start_ns + 12_500_000)
         state.finish()
         tracing.shutdown_telemetry()
 
         spans = exporter.get_finished_spans()
         assert len(spans) == 1
         assert spans[0].start_time == start_time
-        assert spans[0].attributes[attrs.GEN_AI_TIME_TO_FIRST_TOKEN] == 12.5
 
     def test_untrusted_unsampled_remote_parent_uses_local_sampler(self):
         exporter = _start_in_memory_runtime()
@@ -428,6 +424,22 @@ class TestActiveRuntime(TracingTestCase):
         spans = exporter.get_finished_spans()
         assert len(spans) == 1
         assert spans[0].parent is None
+
+    def test_delayed_server_span_uses_rpc_monotonic_start_for_ttft(self):
+        exporter = _start_in_memory_runtime()
+        request_start_ns = time.monotonic_ns()
+        state = tracing.start_server_span(
+            "delayed_ttft",
+            {},
+            start_time=time.time_ns(),
+            request_start_ns=request_start_ns,
+        )
+        assert state is not None
+        state.record_frontend_output_tokens(1, request_start_ns + 50_000_000)
+        state.finish()
+        tracing.shutdown_telemetry()
+        span = exporter.get_finished_spans()[0]
+        assert abs(span.attributes[attrs.GEN_AI_TIME_TO_FIRST_TOKEN] - 50.0) < 1e-6
 
     def test_inject_extract_roundtrip(self):
         _start_in_memory_runtime()
