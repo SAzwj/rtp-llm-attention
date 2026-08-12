@@ -12,6 +12,7 @@ the functional suite into an all-skip success.
 """
 
 import os
+import socket
 import sys
 import time
 import unittest
@@ -42,6 +43,7 @@ TELEMETRY_ENVS = [
     "RTP_LLM_OTEL_SERVICE_NAME",
     "RTP_LLM_OTEL_SCOPE_VERSION",
     "POD_IP",
+    "RequestedIP",
 ]
 
 
@@ -243,6 +245,75 @@ class TestResource(TracingTestCase):
         exporter = _start_in_memory_runtime()
         attributes = self._finished_resource_attributes(exporter)
         assert "host.ip" not in attributes
+
+    def test_resolve_region_env_preserves_existing_pod_ip(self):
+        os.environ["POD_IP"] = "10.1.2.3"
+        os.environ["RequestedIP"] = "10.4.5.6"
+        with mock.patch.object(socket, "gethostbyname") as gethostbyname:
+            tracing.resolve_region_env()
+        assert os.environ["POD_IP"] == "10.1.2.3"
+        gethostbyname.assert_not_called()
+
+    def test_resolve_region_env_uses_requested_ip(self):
+        os.environ["RequestedIP"] = "10.4.5.6"
+        with mock.patch.object(socket, "gethostbyname") as gethostbyname:
+            tracing.resolve_region_env()
+        assert os.environ["POD_IP"] == "10.4.5.6"
+        gethostbyname.assert_not_called()
+
+    def test_resolve_region_env_replaces_empty_pod_ip(self):
+        os.environ["POD_IP"] = ""
+        os.environ["RequestedIP"] = "10.4.5.6"
+        tracing.resolve_region_env()
+        assert os.environ["POD_IP"] == "10.4.5.6"
+
+    def test_resolve_region_env_rejects_invalid_requested_ip(self):
+        os.environ["RequestedIP"] = "127.0.0.1"
+        with mock.patch.object(socket, "gethostbyname", return_value="10.7.8.9"):
+            tracing.resolve_region_env()
+        assert os.environ["POD_IP"] == "10.7.8.9"
+
+    def test_resolve_region_env_uses_hostname_ip(self):
+        with mock.patch.object(
+            socket, "gethostname", return_value="test-host"
+        ), mock.patch.object(
+            socket, "gethostbyname", return_value="10.7.8.9"
+        ) as gethostbyname:
+            tracing.resolve_region_env()
+        assert os.environ["POD_IP"] == "10.7.8.9"
+        gethostbyname.assert_called_once_with("test-host")
+
+    def test_resolve_region_env_dns_failure_is_fail_open(self):
+        with mock.patch.object(
+            socket, "gethostbyname", side_effect=socket.gaierror("not found")
+        ):
+            tracing.resolve_region_env()
+        assert "POD_IP" not in os.environ
+
+    def test_resolve_region_env_rejects_invalid_automatic_ips(self):
+        for resolved_ip in ("", "127.0.0.1", "0.0.0.0"):
+            with self.subTest(resolved_ip=resolved_ip):
+                os.environ.pop("POD_IP", None)
+                os.environ.pop("RequestedIP", None)
+                with mock.patch.object(
+                    socket, "gethostbyname", return_value=resolved_ip
+                ):
+                    tracing.resolve_region_env()
+                assert "POD_IP" not in os.environ
+
+    def test_resolve_region_env_is_idempotent(self):
+        os.environ["RequestedIP"] = "10.4.5.6"
+        tracing.resolve_region_env()
+        os.environ["RequestedIP"] = "10.7.8.9"
+        tracing.resolve_region_env()
+        assert os.environ["POD_IP"] == "10.4.5.6"
+
+    def test_resolved_pod_ip_populates_span_resource(self):
+        os.environ["RequestedIP"] = "10.4.5.6"
+        tracing.resolve_region_env()
+        exporter = _start_in_memory_runtime()
+        attributes = self._finished_resource_attributes(exporter)
+        assert attributes.get("host.ip") == "10.4.5.6"
 
     def test_service_name_derived_from_role(self):
         # no env override -> "rtp_llm_" + role (role-split components)

@@ -13,6 +13,7 @@ Design constraints:
   not via implicit current-span magic across layers.
 """
 
+import ipaddress
 import json
 import logging
 import math
@@ -227,14 +228,12 @@ def _resolve_region_config() -> None:
 
 
 def resolve_region_env() -> None:
-    """Resolve region-mapped OTLP env vars in the launcher process.
+    """Resolve launcher-inherited telemetry env vars and POD_IP.
 
     Must run in the top-level launcher BEFORE child processes spawn: the C++
     backend reads OTEL_EXPORTER_OTLP_TRACES_* strictly from its inherited
-    environment (TelemetryRuntime::init), so writing them only inside the
-    frontend's init_telemetry() would leave the backend without an endpoint.
-    Idempotent (only fills unset keys) and fail-open; no-op without
-    RTP_LLM_OTEL_REGION.
+    environment (TelemetryRuntime::init), and both runtimes read POD_IP for
+    host.ip. Idempotent (only fills unset keys) and fail-open.
     """
     try:
         _resolve_region_config()
@@ -246,6 +245,30 @@ def resolve_region_env() -> None:
                 os.environ["RTP_LLM_OTEL_SCOPE_VERSION"] = _v
     except Exception as e:  # noqa: BLE001 - fail-open by contract
         _LOGGER.warning("telemetry region env resolution failed: %s", e)
+
+    if os.environ.get("POD_IP"):
+        return
+
+    def valid_ip(value: str) -> bool:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return not address.is_loopback and not address.is_unspecified
+
+    resolved_ip = os.environ.get("RequestedIP", "")
+    if not valid_ip(resolved_ip):
+        try:
+            resolved_ip = socket.gethostbyname(socket.gethostname())
+        except OSError as e:
+            _LOGGER.warning("telemetry POD_IP DNS resolution failed: %s", e)
+            return
+    if not valid_ip(resolved_ip):
+        return
+
+    if not os.environ.get("POD_IP"):
+        os.environ.pop("POD_IP", None)
+        os.environ.setdefault("POD_IP", resolved_ip)
 
 
 class _DiagnosticExporter:
