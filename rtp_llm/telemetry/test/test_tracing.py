@@ -11,9 +11,11 @@ The unskipped dependency-contract test prevents a missing runtime from turning
 the functional suite into an all-skip success.
 """
 
+import json
 import os
 import socket
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -32,8 +34,14 @@ except ImportError:  # pragma: no cover - exercised only on bare images
 
 TELEMETRY_ENVS = [
     "RTP_LLM_OTEL_TRACE_ENABLE",
+    "RTP_LLM_OTEL_REGION",
+    "RTP_LLM_OTEL_REGION_CONFIG_FILE",
     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
     "RTP_LLM_OTEL_TRACE_SAMPLER_RATIO",
     "RTP_LLM_OTEL_TRUST_REMOTE_SAMPLING",
     "RTP_LLM_OTEL_BSP_MAX_QUEUE_SIZE",
@@ -180,6 +188,190 @@ class TestConfig(TracingTestCase):
         ):
             assert not tracing.init_telemetry("frontend", 0)
             assert tracing.telemetry_state() == tracing.TelemetryState.DISABLED
+
+    def test_invalid_region_config_shape_uses_explicit_endpoint(self):
+        os.environ["RTP_LLM_OTEL_TRACE_ENABLE"] = "1"
+        os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
+        os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = (
+            "http://127.0.0.1:4318/v1/traces"
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            config_file.write("[]")
+            config_file.flush()
+            os.environ["RTP_LLM_OTEL_REGION_CONFIG_FILE"] = config_file.name
+            with self.assertLogs(tracing._LOGGER, level="WARNING") as logs:
+                assert tracing.init_telemetry("frontend", 0)
+
+        assert tracing.telemetry_state() == tracing.TelemetryState.ACTIVE
+        assert any(
+            "region config resolution failed" in message for message in logs.output
+        )
+
+    def test_invalid_region_entry_does_not_partially_update_environment(self):
+        os.environ["RTP_LLM_OTEL_TRACE_ENABLE"] = "1"
+        os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
+        config = {
+            "regions": {
+                "cn-test": {
+                    "endpoint": "http://region-collector:4318/v1/traces",
+                    "headers": ["invalid"],
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            json.dump(config, config_file)
+            config_file.flush()
+            os.environ["RTP_LLM_OTEL_REGION_CONFIG_FILE"] = config_file.name
+            with self.assertLogs(tracing._LOGGER, level="WARNING"):
+                assert not tracing.init_telemetry("frontend", 0)
+
+        assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in os.environ
+        assert "OTEL_EXPORTER_OTLP_TRACES_HEADERS" not in os.environ
+
+    def test_explicit_generic_endpoint_rejects_region_carrier(self):
+        os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://explicit:4318"
+        config = {
+            "regions": {
+                "cn-test": {
+                    "endpoint": "http://region-collector:4318/v1/traces",
+                    "headers": "authorization=region",
+                    "certificate": "/region/ca.pem",
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            json.dump(config, config_file)
+            config_file.flush()
+            os.environ["RTP_LLM_OTEL_REGION_CONFIG_FILE"] = config_file.name
+            tracing._resolve_region_config()
+
+        assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in os.environ
+        assert "OTEL_EXPORTER_OTLP_TRACES_HEADERS" not in os.environ
+        assert "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE" not in os.environ
+        assert tracing.resolve_endpoint() == "http://explicit:4318/v1/traces"
+
+    def test_explicit_signal_endpoint_rejects_region_credentials(self):
+        os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
+        os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = (
+            "http://explicit:4318/v1/traces"
+        )
+        config = {
+            "regions": {
+                "cn-test": {
+                    "endpoint": "http://region-collector:4318/v1/traces",
+                    "headers": "authorization=region",
+                    "certificate": "/region/ca.pem",
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            json.dump(config, config_file)
+            config_file.flush()
+            os.environ["RTP_LLM_OTEL_REGION_CONFIG_FILE"] = config_file.name
+            tracing._resolve_region_config()
+
+        assert os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"].startswith(
+            "http://explicit:"
+        )
+        assert "OTEL_EXPORTER_OTLP_TRACES_HEADERS" not in os.environ
+        assert "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE" not in os.environ
+
+    def test_explicit_signal_credentials_reject_region_endpoint(self):
+        os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
+        os.environ["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] = (
+            "authorization=explicit"
+        )
+        config = {
+            "regions": {
+                "cn-test": {
+                    "endpoint": "http://region-collector:4318/v1/traces",
+                    "headers": "authorization=region",
+                    "certificate": "/region/ca.pem",
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            json.dump(config, config_file)
+            config_file.flush()
+            os.environ["RTP_LLM_OTEL_REGION_CONFIG_FILE"] = config_file.name
+            tracing._resolve_region_config()
+
+        assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in os.environ
+        assert (
+            os.environ["OTEL_EXPORTER_OTLP_TRACES_HEADERS"]
+            == "authorization=explicit"
+        )
+        assert "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE" not in os.environ
+
+    def test_explicit_generic_credentials_reject_region_endpoint(self):
+        os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
+        os.environ["OTEL_EXPORTER_OTLP_CERTIFICATE"] = "/explicit/ca.pem"
+        config = {
+            "regions": {
+                "cn-test": {
+                    "endpoint": "http://region-collector:4318/v1/traces",
+                    "headers": "authorization=region",
+                    "certificate": "/region/ca.pem",
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            json.dump(config, config_file)
+            config_file.flush()
+            os.environ["RTP_LLM_OTEL_REGION_CONFIG_FILE"] = config_file.name
+            tracing._resolve_region_config()
+
+        assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in os.environ
+        assert "OTEL_EXPORTER_OTLP_TRACES_HEADERS" not in os.environ
+        assert os.environ["OTEL_EXPORTER_OTLP_CERTIFICATE"] == "/explicit/ca.pem"
+
+    def test_region_config_preserves_explicit_signal_environment(self):
+        os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
+        explicit_env = {
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://explicit:4318/v1/traces",
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "authorization=explicit",
+            "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE": "/explicit/ca.pem",
+        }
+        os.environ.update(explicit_env)
+        config = {
+            "regions": {
+                "cn-test": {
+                    "endpoint": "http://region-collector:4318/v1/traces",
+                    "headers": "authorization=region",
+                    "certificate": "/region/ca.pem",
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            json.dump(config, config_file)
+            config_file.flush()
+            os.environ["RTP_LLM_OTEL_REGION_CONFIG_FILE"] = config_file.name
+            tracing._resolve_region_config()
+
+        for env_name, value in explicit_env.items():
+            assert os.environ[env_name] == value
+
+    def test_region_credentials_without_endpoint_are_not_injected(self):
+        os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
+        config = {
+            "regions": {
+                "cn-test": {
+                    "headers": "authorization=region",
+                    "certificate": "/region/ca.pem",
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            json.dump(config, config_file)
+            config_file.flush()
+            os.environ["RTP_LLM_OTEL_REGION_CONFIG_FILE"] = config_file.name
+            with self.assertLogs(tracing._LOGGER, level="WARNING"):
+                tracing._resolve_region_config()
+
+        assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in os.environ
+        assert "OTEL_EXPORTER_OTLP_TRACES_HEADERS" not in os.environ
+        assert "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE" not in os.environ
 
 
 class TestInactiveNoop(TracingTestCase):

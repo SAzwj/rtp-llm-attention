@@ -130,7 +130,7 @@ class FrontendServerTest(TestCase):
             yield FakePipelinResponse(res="first")
             yield FakePipelinResponse(res="second")
 
-        def _generate_call():
+        def _generate_call(_request_metrics):
             return CompleteResponseAsyncGenerator(
                 _generate(), CompleteResponseAsyncGenerator.get_last_value
             )
@@ -207,7 +207,7 @@ class FrontendServerTest(TestCase):
                 for response in responses:
                     yield response
 
-            def _generate_call():
+            def _generate_call(_request_metrics):
                 return CompleteResponseAsyncGenerator(
                     _generate(), CompleteResponseAsyncGenerator.get_last_value
                 )
@@ -278,7 +278,7 @@ class FrontendServerTest(TestCase):
                 for response in responses:
                     yield response
 
-            def _generate_call():
+            def _generate_call(_request_metrics):
                 return CompleteResponseAsyncGenerator(
                     _generate(), CompleteResponseAsyncGenerator.get_last_value
                 )
@@ -467,7 +467,8 @@ class FrontendServerTest(TestCase):
             tracing.init_telemetry_for_test(exporter, role="test", tp_rank=0)
         )
         try:
-            asyncio.run(_run())
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(_run())
         finally:
             tracing.shutdown_telemetry()
 
