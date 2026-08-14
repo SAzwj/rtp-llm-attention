@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <memory>
 #include <unistd.h>
@@ -36,6 +37,11 @@ const int RDMA_CONNECT_RETRY_TIME = 3;
 namespace {
 torch::TensorOptions runtimeCudaI32Options() {
     return torch::TensorOptions().dtype(torch::kInt32).device(rtp_llm::getTorchCudaDevice());
+}
+
+int64_t monotonicTimeUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 }  // namespace
 
@@ -260,6 +266,7 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
     auto&             grpc_stream     = decode_context.rpc_context.grpc_stream;
     auto&             generate_stream = decode_context.getStream();
     GenerateRequestPB generate_request;
+    const auto        read_begin_us = monotonicTimeUs();
     if (!grpc_stream->Read(&generate_request)) {
         const bool cancelled        = decode_context.server_context->IsCancelled();
         decode_context.error_status = generateRequestReadFailureStatus(cancelled);
@@ -269,18 +276,25 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
                             static_cast<int>(decode_context.error_status.error_code()));
         return;
     }
+    const auto read_end_us = monotonicTimeUs();
     GRPC_RET_IF_ERROR(decode_context,
                       generate_request.stage() == RemoteStage::GENERATE,
                       grpc::StatusCode::INTERNAL,
                       "message first status != RemoteStage::GENERATE");
     decode_context.time_info.updateGenerateBeginTime();
+    const auto generate_begin_updated_us = monotonicTimeUs();
+    const auto stream_step_begin_us      = monotonicTimeUs();
     generate_stream->setIsContextStream(false);
     generate_stream->step();
+    const auto stream_step_end_us = monotonicTimeUs();
 
-    auto new_tokens = torch::zeros({(int64_t)generate_stream->nextBatchSize(), 1}, torch::kInt32);
+    auto       new_tokens                = torch::zeros({(int64_t)generate_stream->nextBatchSize(), 1}, torch::kInt32);
+    const auto stream_input_allocated_us = monotonicTimeUs();
 
-    new_tokens.data_ptr<int32_t>()[0] = generate_request.first_generate_token_id();
+    new_tokens.data_ptr<int32_t>()[0]   = generate_request.first_generate_token_id();
+    const auto stream_input_assigned_us = monotonicTimeUs();
     generate_stream->incLastOutputPos();
+    const auto stream_output_pos_advanced_us = monotonicTimeUs();
     generate_stream->update({new_tokens,
                              1,
                              torch::Tensor(),
@@ -298,6 +312,8 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
                              torch::Tensor(),
                              -1,
                              generate_stream->generateConfig()->return_logprobs ? 1 : 0});
+    const auto stream_updated_us     = monotonicTimeUs();
+    const auto position_ids_begin_us = monotonicTimeUs();
     if (generate_request.position_ids_size() > 0) {
         auto context_position_ids = torch::from_blob(const_cast<int32_t*>(generate_request.position_ids().data()),
                                                      {(int64_t)generate_request.position_ids_size()},
@@ -305,10 +321,32 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
                                         .clone();
         generate_stream->setContextPositionIds(context_position_ids);
     }
+    const auto position_ids_done_us  = monotonicTimeUs();
+    const auto normal_state_begin_us = monotonicTimeUs();
     if (!propose_maga_init_params_) {
         generate_stream->markGrpcNormalDeviceStatePending();
     }
+    const auto normal_state_done_us      = monotonicTimeUs();
+    int64_t    mtp_begin_us              = -1;
+    int64_t    mtp_tokens_ready_us       = -1;
+    int64_t    mtp_probs_converted_us    = -1;
+    int64_t    mtp_probs_pinned_us       = -1;
+    int64_t    mtp_hidden_converted_us   = -1;
+    int64_t    mtp_hidden_pinned_us      = -1;
+    int64_t    mtp_probs_h2d_us          = -1;
+    int64_t    mtp_hidden_h2d_us         = -1;
+    int64_t    mtp_device_allocated_us   = -1;
+    int64_t    mtp_scalar_assigned_us    = -1;
+    int64_t    mtp_next_seq_allocated_us = -1;
+    int64_t    mtp_next_seq_assigned_us  = -1;
+    int64_t    mtp_holder_ready_us       = -1;
+    int64_t    mtp_state_published_us    = -1;
+    int64_t    propose_probs_numel       = -1;
+    int64_t    propose_hidden_numel      = -1;
+    int64_t    propose_probs_bytes       = -1;
+    int64_t    propose_hidden_bytes      = -1;
     if (propose_maga_init_params_) {
+        mtp_begin_us              = monotonicTimeUs();
         const size_t propose_step = propose_maga_init_params_->gen_num_per_circle;
         RTP_LLM_CHECK_WITH_INFO(propose_step > 0, "decode rpc propose_step should be positive");
         if (maga_init_params_.sp_config.gen_num_per_cycle > 0) {
@@ -334,34 +372,54 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
         sp_output_buffer->tokens       = torch::zeros({1, (int64_t)propose_tokens.size()},
                                                 torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
         memcpy(sp_output_buffer->tokens.data_ptr<int>(), propose_tokens.data(), propose_tokens.size() * sizeof(int));
+        mtp_tokens_ready_us = monotonicTimeUs();
 
         // REBASE CONFLICT CONTEXT(b08feda05): new base pins grpc tensors for
         // safe non-blocking host lifetime; source branch also publishes GPU
         // speculative state for MTP graft prefill cudagraph. Keep both.
-        auto propose_probs_t  = pinGrpcTensor(QueryConverter::transTensor(generate_request.propose_probs()));
-        auto propose_hidden_t = pinGrpcTensor(QueryConverter::transTensor(generate_request.propose_hidden()));
+        auto propose_probs_t   = QueryConverter::transTensor(generate_request.propose_probs());
+        mtp_probs_converted_us = monotonicTimeUs();
+        propose_probs_numel    = propose_probs_t.defined() ? propose_probs_t.numel() : 0;
+        propose_probs_bytes = propose_probs_t.defined() ? propose_probs_t.numel() * propose_probs_t.element_size() : 0;
+        propose_probs_t     = pinGrpcTensor(std::move(propose_probs_t));
+        mtp_probs_pinned_us = monotonicTimeUs();
+
+        auto propose_hidden_t   = QueryConverter::transTensor(generate_request.propose_hidden());
+        mtp_hidden_converted_us = monotonicTimeUs();
+        propose_hidden_numel    = propose_hidden_t.defined() ? propose_hidden_t.numel() : 0;
+        propose_hidden_bytes =
+            propose_hidden_t.defined() ? propose_hidden_t.numel() * propose_hidden_t.element_size() : 0;
+        propose_hidden_t     = pinGrpcTensor(std::move(propose_hidden_t));
+        mtp_hidden_pinned_us = monotonicTimeUs();
 
         c10::DeviceGuard runtime_device_guard(getTorchCudaDevice());
         const auto       cuda_i32       = runtimeCudaI32Options();
         sp_output_buffer->all_probs     = propose_probs_t.to(getTorchCudaDevice());
+        mtp_probs_h2d_us                = monotonicTimeUs();
         sp_output_buffer->hidden_states = propose_hidden_t.to(getTorchCudaDevice());
+        mtp_hidden_h2d_us               = monotonicTimeUs();
 
         auto propose_tokens_gpu              = torch::empty({1}, cuda_i32);
         auto target_token_gpu                = torch::empty({1}, cuda_i32);
         auto accept_len                      = torch::ones({1}, cuda_i32);
         auto accept_tokens                   = torch::zeros({1, static_cast<int64_t>(propose_step + 1)}, cuda_i32);
+        mtp_device_allocated_us              = monotonicTimeUs();
         accept_tokens[0][0]                  = sp_output_buffer->tokens[0][0];
         target_token_gpu[0]                  = sp_output_buffer->tokens[0][0];
         propose_tokens_gpu[0]                = sp_output_buffer->tokens[0][1];
         sp_output_buffer->target_token_gpu   = target_token_gpu;
         sp_output_buffer->propose_tokens_gpu = propose_tokens_gpu;
+        mtp_scalar_assigned_us               = monotonicTimeUs();
 
-        auto next_seq_len = torch::ones({1}, cuda_i32);
-        next_seq_len[0]   = generate_stream->seqLength();
+        auto next_seq_len         = torch::ones({1}, cuda_i32);
+        mtp_next_seq_allocated_us = monotonicTimeUs();
+        next_seq_len[0]           = generate_stream->seqLength();
+        mtp_next_seq_assigned_us  = monotonicTimeUs();
 
         sp_output_buffer->tensors_holder.push_back(std::move(propose_probs_t));
         sp_output_buffer->tensors_holder.push_back(std::move(propose_hidden_t));
         generate_stream->setSPOutputBuffer(sp_output_buffer);
+        mtp_holder_ready_us = monotonicTimeUs();
         generate_stream->setMtpAsyncDeviceState(GenerateStream::MtpAsyncDeviceState{
             .epoch                  = 0,
             .accept_len_gpu         = std::move(accept_len),
@@ -373,21 +431,84 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
             .last_real_seq_len      = generate_stream->seqLength(),
             .next_real_seq_len      = generate_stream->seqLength(),
         });
+        mtp_state_published_us = monotonicTimeUs();
     }
 
+    const auto before_reset_us = monotonicTimeUs();
     generate_stream->resetBeginTime(currentTimeUs());
+    const auto after_reset_us = monotonicTimeUs();
+    RTP_LLM_LOG_INFO(
+        "[gap1-probe] version=2 request=%s read_begin_mono_us=%ld reset_done_mono_us=%ld message_bytes=%zu "
+        "handler_total_us=%ld read_us=%ld "
+        "update_generate_begin_us=%ld stream_step_us=%ld stream_input_alloc_us=%ld stream_input_assign_us=%ld "
+        "stream_output_pos_us=%ld stream_update_us=%ld position_ids_us=%ld normal_state_us=%ld "
+        "post_read_setup_us=%ld "
+        "mtp_tokens_us=%ld mtp_probs_convert_us=%ld mtp_probs_pin_us=%ld mtp_hidden_convert_us=%ld "
+        "mtp_hidden_pin_us=%ld mtp_probs_h2d_us=%ld mtp_hidden_h2d_us=%ld "
+        "mtp_device_alloc_us=%ld mtp_scalar_assign_us=%ld mtp_next_seq_alloc_us=%ld mtp_next_seq_assign_us=%ld "
+        "mtp_holder_us=%ld mtp_publish_us=%ld reset_us=%ld "
+        "propose_probs_numel=%ld propose_probs_bytes=%ld propose_hidden_numel=%ld propose_hidden_bytes=%ld",
+        decode_context.request_key.c_str(),
+        read_begin_us,
+        after_reset_us,
+        generate_request.ByteSizeLong(),
+        after_reset_us - read_begin_us,
+        read_end_us - read_begin_us,
+        generate_begin_updated_us - read_end_us,
+        stream_step_end_us - stream_step_begin_us,
+        stream_input_allocated_us - stream_step_end_us,
+        stream_input_assigned_us - stream_input_allocated_us,
+        stream_output_pos_advanced_us - stream_input_assigned_us,
+        stream_updated_us - stream_output_pos_advanced_us,
+        position_ids_done_us - position_ids_begin_us,
+        normal_state_done_us - normal_state_begin_us,
+        before_reset_us - generate_begin_updated_us,
+        mtp_begin_us >= 0 ? mtp_tokens_ready_us - mtp_begin_us : -1,
+        mtp_begin_us >= 0 ? mtp_probs_converted_us - mtp_tokens_ready_us : -1,
+        mtp_begin_us >= 0 ? mtp_probs_pinned_us - mtp_probs_converted_us : -1,
+        mtp_begin_us >= 0 ? mtp_hidden_converted_us - mtp_probs_pinned_us : -1,
+        mtp_begin_us >= 0 ? mtp_hidden_pinned_us - mtp_hidden_converted_us : -1,
+        mtp_begin_us >= 0 ? mtp_probs_h2d_us - mtp_hidden_pinned_us : -1,
+        mtp_begin_us >= 0 ? mtp_hidden_h2d_us - mtp_probs_h2d_us : -1,
+        mtp_begin_us >= 0 ? mtp_device_allocated_us - mtp_hidden_h2d_us : -1,
+        mtp_begin_us >= 0 ? mtp_scalar_assigned_us - mtp_device_allocated_us : -1,
+        mtp_begin_us >= 0 ? mtp_next_seq_allocated_us - mtp_scalar_assigned_us : -1,
+        mtp_begin_us >= 0 ? mtp_next_seq_assigned_us - mtp_next_seq_allocated_us : -1,
+        mtp_begin_us >= 0 ? mtp_holder_ready_us - mtp_next_seq_assigned_us : -1,
+        mtp_begin_us >= 0 ? mtp_state_published_us - mtp_holder_ready_us : -1,
+        after_reset_us - before_reset_us,
+        propose_probs_numel,
+        propose_probs_bytes,
+        propose_hidden_numel,
+        propose_hidden_bytes);
     RTP_LLM_LOG_DEBUG(
         "decode init stream[%s]: %s", generate_stream->streamLogTag().c_str(), generate_stream->debugString().c_str());
     engine_->enqueue(generate_stream);
     RTP_LLM_LOG_DEBUG("request [%s] enqueue success", decode_context.request_key.c_str());
+    const auto poll_begin_us = monotonicTimeUs();
     decode_context.error_status =
         pollStreamOutput(decode_context.server_context,
                          decode_context.request_key,
                          dynamic_cast<grpc::internal::WriterInterface<GenerateOutputsPB>*>(grpc_stream),
                          generate_stream);
+    const auto poll_end_us = monotonicTimeUs();
+    RTP_LLM_LOG_INFO(
+        "[terminal-probe] version=1 phase=decode_poll_return mono_us=%ld request=%s poll_us=%ld grpc_status=%d",
+        poll_end_us,
+        decode_context.request_key.c_str(),
+        poll_end_us - poll_begin_us,
+        static_cast<int>(decode_context.error_status.error_code()));
     decode_context.time_info.updateGenerateEndTime();
     meta_->dequeue(decode_context.request_id, decode_context.getStream());
 
+    const auto local_generate_done_us = monotonicTimeUs();
+    RTP_LLM_LOG_INFO(
+        "[terminal-probe] version=1 phase=decode_local_generate_done mono_us=%ld request=%s post_poll_us=%ld "
+        "grpc_status=%d",
+        local_generate_done_us,
+        decode_context.request_key.c_str(),
+        local_generate_done_us - poll_end_us,
+        static_cast<int>(decode_context.error_status.error_code()));
     RTP_LLM_LOG_DEBUG("request [%s] local generate done", decode_context.request_key.c_str());
 }
 
@@ -1373,13 +1494,27 @@ grpc::Status DecodeRpcServer::RemoteGenerate(grpc::ServerContext* server_context
     } catch (const std::exception& e) {
         auto error_msg              = "request [" + decode_context.request_key + "] catch exception [" + e.what() + "]";
         decode_context.error_status = grpc::Status(grpc::StatusCode::INTERNAL, error_msg);
+        RTP_LLM_LOG_INFO("[terminal-probe] version=1 phase=decode_rpc_handler_return mono_us=%ld request=%s "
+                         "grpc_status=%d",
+                         monotonicTimeUs(),
+                         decode_context.request_key.c_str(),
+                         static_cast<int>(decode_context.error_status.error_code()));
         return decode_context.error_status;
     } catch (...) {
         auto error_msg              = "request [" + decode_context.request_key + "] catch unknown exception";
         decode_context.error_status = grpc::Status(grpc::StatusCode::INTERNAL, error_msg);
+        RTP_LLM_LOG_INFO("[terminal-probe] version=1 phase=decode_rpc_handler_return mono_us=%ld request=%s "
+                         "grpc_status=%d",
+                         monotonicTimeUs(),
+                         decode_context.request_key.c_str(),
+                         static_cast<int>(decode_context.error_status.error_code()));
         return decode_context.error_status;
     }
 
+    RTP_LLM_LOG_INFO("[terminal-probe] version=1 phase=decode_rpc_handler_return mono_us=%ld request=%s grpc_status=%d",
+                     monotonicTimeUs(),
+                     decode_context.request_key.c_str(),
+                     static_cast<int>(grpc::StatusCode::OK));
     return grpc::Status::OK;
 }
 

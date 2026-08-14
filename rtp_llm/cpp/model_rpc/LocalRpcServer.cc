@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,11 @@ using namespace std;
 namespace rtp_llm {
 
 namespace {
+
+int64_t monotonicTimeUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 std::string formatRequestLogTag(const std::string& request_key, const RequestInfo& request_info) {
     std::string tag = "request [" + request_key + "]";
@@ -119,39 +125,105 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*             c
                                               WriterInterface*                 writer,
                                               std::shared_ptr<GenerateStream>& stream) {
     RTP_LLM_PROFILE_FUNCTION();
+    const auto poll_begin_us = monotonicTimeUs();
+    int64_t    output_index  = 0;
     // 需要检查 !hasError(): 之前 finished() 表示完成且无错，现在 FINISHED 状态可能包含错误
     // 如果流有错误，应该停止消费输出
     while (stream->isActive() || stream->hasOutput()) {
-        const auto result = stream->nextOutput();
+        const auto next_output_begin_us = monotonicTimeUs();
+        const auto result               = stream->nextOutput();
+        const auto next_output_end_us   = monotonicTimeUs();
         if (!result.ok()) {
             if (result.status().code() != ErrorCode::FINISHED) {
+                RTP_LLM_LOG_INFO(
+                    "[terminal-probe] version=1 phase=next_output_error mono_us=%ld request=%s output_index=%ld "
+                    "next_output_us=%ld poll_elapsed_us=%ld error_code=%d",
+                    next_output_end_us,
+                    request_key.c_str(),
+                    output_index,
+                    next_output_end_us - next_output_begin_us,
+                    next_output_end_us - poll_begin_us,
+                    static_cast<int>(result.status().code()));
                 return serializeErrorMsg(request_key, stream->generateInput()->request_info, result.status());
             } else {
+                RTP_LLM_LOG_INFO(
+                    "[terminal-probe] version=1 phase=next_output_finished mono_us=%ld request=%s output_index=%ld "
+                    "next_output_us=%ld poll_elapsed_us=%ld",
+                    next_output_end_us,
+                    request_key.c_str(),
+                    output_index,
+                    next_output_end_us - next_output_begin_us,
+                    next_output_end_us - poll_begin_us);
                 break;
             }
         }
         RTP_LLM_LOG_DEBUG("request [%s] generate next output success", request_key.c_str());
+        const auto& outputs              = result.value();
+        const bool  application_finished = !outputs.generate_outputs.empty()
+                                          && std::all_of(outputs.generate_outputs.begin(),
+                                                         outputs.generate_outputs.end(),
+                                                         [](const auto& output) { return output.finished; });
         GenerateOutputsPB outputs_pb;
 
+        const auto response_convert_begin_us = monotonicTimeUs();
         QueryConverter::transResponse(&outputs_pb,
-                                      &(result.value()),
+                                      &outputs,
                                       stream->generateConfig()->aux_info,
                                       maga_init_params_.misc_config.aux_string,
                                       stream->specialTokens().eos_token_id);
+        const auto response_convert_end_us = monotonicTimeUs();
         if (context->IsCancelled()) {
             stream->reportError(ErrorCode::CANCELLED, "request cancelled by user");
+            RTP_LLM_LOG_INFO("[terminal-probe] version=1 phase=write_cancelled mono_us=%ld request=%s output_index=%ld "
+                             "application_finished=%d poll_elapsed_us=%ld",
+                             response_convert_end_us,
+                             request_key.c_str(),
+                             output_index,
+                             application_finished ? 1 : 0,
+                             response_convert_end_us - poll_begin_us);
             RTP_LLM_LOG_WARNING("request [%s] cancelled by user", request_key.c_str());
             return grpc::Status(grpc::StatusCode::CANCELLED, "request cancelled by user");
         }
+        const auto write_begin_us = monotonicTimeUs();
         if (!writer->Write(outputs_pb)) {
+            const auto write_end_us = monotonicTimeUs();
             stream->reportError(ErrorCode::CANCELLED, "write outputs pb failed");
+            RTP_LLM_LOG_INFO("[terminal-probe] version=1 phase=write_failed mono_us=%ld request=%s output_index=%ld "
+                             "application_finished=%d write_us=%ld poll_elapsed_us=%ld",
+                             write_end_us,
+                             request_key.c_str(),
+                             output_index,
+                             application_finished ? 1 : 0,
+                             write_end_us - write_begin_us,
+                             write_end_us - poll_begin_us);
             RTP_LLM_LOG_WARNING("request [%s] write outputs pb failed", request_key.c_str());
             return responseStreamWriteFailedStatus();
         }
+        const auto write_end_us = monotonicTimeUs();
+        if (application_finished) {
+            RTP_LLM_LOG_INFO(
+                "[terminal-probe] version=1 phase=final_write_done mono_us=%ld request=%s output_index=%ld "
+                "next_output_us=%ld response_convert_us=%ld write_us=%ld poll_elapsed_us=%ld",
+                write_end_us,
+                request_key.c_str(),
+                output_index,
+                next_output_end_us - next_output_begin_us,
+                response_convert_end_us - response_convert_begin_us,
+                write_end_us - write_begin_us,
+                write_end_us - poll_begin_us);
+        }
+        ++output_index;
         if (stream->hasEvent(StreamEvents::NeedRemoteGenerate)) {
             break;
         }
     }
+    const auto poll_end_us = monotonicTimeUs();
+    RTP_LLM_LOG_INFO("[terminal-probe] version=1 phase=poll_return mono_us=%ld request=%s output_count=%ld "
+                     "poll_total_us=%ld",
+                     poll_end_us,
+                     request_key.c_str(),
+                     output_index,
+                     poll_end_us - poll_begin_us);
     RTP_LLM_LOG_DEBUG("request [%s] local generate done", request_key.c_str());
 
     return grpc::Status::OK;

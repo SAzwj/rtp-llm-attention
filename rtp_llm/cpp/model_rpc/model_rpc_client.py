@@ -3,6 +3,7 @@ import functools
 import json
 import logging
 import math
+import time
 from typing import Any, AsyncGenerator, Optional
 
 import grpc
@@ -76,6 +77,22 @@ async def _wait_for_rpc_termination(response_iterator: Any) -> Any:
     except Exception:
         pass
     return None
+
+
+def _rpc_status_name(status: Any) -> str:
+    if status is None:
+        return "unknown"
+    name = getattr(status, "name", None)
+    return str(name if name is not None else status)
+
+
+def _terminal_probe_identity(input_pb: GenerateInputPB) -> tuple[int, str, str]:
+    request_info = input_pb.request_info
+    return (
+        int(input_pb.request_id),
+        str(request_info.trace_id or ""),
+        str(request_info.request_id or ""),
+    )
 
 
 def _record_client_rpc_status(client_span: Any, status: Any) -> None:
@@ -724,6 +741,10 @@ class ModelRpcClient(object):
         response_iterator = None
         rpc_status = None
         stream_state = StreamState()
+        request_id, trace_id, external_request_id = _terminal_probe_identity(input_pb)
+        response_index = 0
+        engine_finished = False
+        rpc_termination_logged = False
 
         address_list = self._addresses
         selected_role = None
@@ -771,9 +792,24 @@ class ModelRpcClient(object):
             response_iterator = stub.GenerateStreamCall(input_pb, **grpc_kwargs)
             # 调用服务器方法并接收流式响应
             async for response in response_iterator.__aiter__():
+                current_response_index = response_index
+                response_index += 1
                 output_py = trans_output(input_py, response, stream_state)
                 last_output = output_py
-                if _engine_reported_finished(output_py):
+                engine_finished = _engine_reported_finished(output_py)
+                if engine_finished:
+                    final_frame_received_us = time.monotonic_ns() // 1000
+                    logging.info(
+                        "[terminal-probe] version=1 phase=python_finished_frame_received "
+                        "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                        "response_index=%d target=%s",
+                        final_frame_received_us,
+                        request_id,
+                        trace_id,
+                        external_request_id,
+                        current_response_index,
+                        target_address,
+                    )
                     # The finished application frame is not the gRPC EOF. If it
                     # escapes first, an upstream renderer can close this generator
                     # while the server is still settling the RPC, converting a
@@ -782,6 +818,31 @@ class ModelRpcClient(object):
                     # so wait for that physical boundary before publishing the
                     # final frame.
                     rpc_status = await _wait_for_rpc_termination(response_iterator)
+                    rpc_terminated_us = time.monotonic_ns() // 1000
+                    logging.info(
+                        "[terminal-probe] version=1 phase=python_rpc_terminated "
+                        "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                        "response_index=%d final_to_rpc_terminal_us=%d grpc_status=%s",
+                        rpc_terminated_us,
+                        request_id,
+                        trace_id,
+                        external_request_id,
+                        current_response_index,
+                        rpc_terminated_us - final_frame_received_us,
+                        _rpc_status_name(rpc_status),
+                    )
+                    rpc_termination_logged = True
+                    logging.info(
+                        "[terminal-probe] version=1 phase=python_finished_frame_yield "
+                        "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                        "response_index=%d grpc_status=%s",
+                        time.monotonic_ns() // 1000,
+                        request_id,
+                        trace_id,
+                        external_request_id,
+                        current_response_index,
+                        _rpc_status_name(rpc_status),
+                    )
                 yield output_py
         except grpc.RpcError as e:
             rpc_status = e.code()
@@ -839,6 +900,20 @@ class ModelRpcClient(object):
                     response_iterator.cancel()
                 if rpc_status is None:
                     rpc_status = await _wait_for_rpc_termination(response_iterator)
+                if not rpc_termination_logged:
+                    logging.info(
+                        "[terminal-probe] version=1 phase=python_rpc_terminated "
+                        "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                        "response_index=%d engine_finished=%d grpc_status=%s cause=generator_cancel",
+                        time.monotonic_ns() // 1000,
+                        request_id,
+                        trace_id,
+                        external_request_id,
+                        response_index,
+                        1 if engine_finished else 0,
+                        _rpc_status_name(rpc_status),
+                    )
+                    rpc_termination_logged = True
                 _record_client_rpc_status(client_span, rpc_status)
             if client_span is not None:
                 _record_client_span_usage(client_span, last_output)
@@ -853,6 +928,20 @@ class ModelRpcClient(object):
                 response_iterator.cancel()
                 if rpc_status is None:
                     rpc_status = await _wait_for_rpc_termination(response_iterator)
+                if not rpc_termination_logged:
+                    logging.info(
+                        "[terminal-probe] version=1 phase=python_rpc_terminated "
+                        "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                        "response_index=%d engine_finished=%d grpc_status=%s cause=exception",
+                        time.monotonic_ns() // 1000,
+                        request_id,
+                        trace_id,
+                        external_request_id,
+                        response_index,
+                        1 if engine_finished else 0,
+                        _rpc_status_name(rpc_status),
+                    )
+                    rpc_termination_logged = True
                 _record_client_rpc_status(client_span, rpc_status)
             if client_span is not None:
                 _record_client_span_usage(client_span, last_output)
@@ -870,3 +959,28 @@ class ModelRpcClient(object):
                 client_span.finish()
             if response_iterator:
                 response_iterator.cancel()
+            if not rpc_termination_logged:
+                logging.info(
+                    "[terminal-probe] version=1 phase=python_rpc_terminated "
+                    "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                    "response_index=%d engine_finished=%d grpc_status=%s cause=iterator_close",
+                    time.monotonic_ns() // 1000,
+                    request_id,
+                    trace_id,
+                    external_request_id,
+                    response_index,
+                    1 if engine_finished else 0,
+                    _rpc_status_name(rpc_status),
+                )
+            logging.info(
+                "[terminal-probe] version=1 phase=python_response_iter_closed "
+                "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                "response_count=%d engine_finished=%d grpc_status=%s",
+                time.monotonic_ns() // 1000,
+                request_id,
+                trace_id,
+                external_request_id,
+                response_index,
+                1 if engine_finished else 0,
+                _rpc_status_name(rpc_status),
+            )

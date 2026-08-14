@@ -1777,6 +1777,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         )
         trace_state = None
         current_rtp_llm_request_id: Optional[int] = None
+        current_trace_id = ""
         current_external_request_id = ""
 
         def _ensure_span(body_headers: Optional[dict[str, str]] = None):
@@ -1818,6 +1819,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                 record.req_count += 1
                 rtp_llm_request_id = self._next_rtp_llm_request_id()
                 current_rtp_llm_request_id = rtp_llm_request_id
+                current_trace_id = str(request.id)
                 current_external_request_id = extract_span_external_request_id(
                     invocation_metadata, request
                 )
@@ -1951,8 +1953,12 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     yield_access_stats=True,
                     frontend_metric_tags=self._frontend_metric_tags(),
                 )
+                dash_response_index = 0
+                first_business_frame_logged = False
                 try:
                     async for resp, stats in response_iter:
+                        current_dash_response_index = dash_response_index
+                        dash_response_index += 1
                         (
                             delta_len,
                             finished,
@@ -1981,9 +1987,76 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                             trace_state.record_frontend_output_tokens(
                                 len(generated_ids_for_log)
                             )
+                        if current_dash_response_index == 0:
+                            logging.info(
+                                "[terminal-probe] version=1 phase=dash_first_frame_yield "
+                                "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                                "response_index=%d delta_len=%d finished=%d finish_reason=%s",
+                                time.monotonic_ns() // 1000,
+                                rtp_llm_request_id,
+                                request.id,
+                                current_external_request_id,
+                                current_dash_response_index,
+                                delta_len,
+                                1 if finished else 0,
+                                finish_reason,
+                            )
+                        if delta_len and not first_business_frame_logged:
+                            logging.info(
+                                "[terminal-probe] version=1 phase=dash_first_business_frame_yield "
+                                "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                                "response_index=%d delta_len=%d finished=%d finish_reason=%s",
+                                time.monotonic_ns() // 1000,
+                                rtp_llm_request_id,
+                                request.id,
+                                current_external_request_id,
+                                current_dash_response_index,
+                                delta_len,
+                                1 if finished else 0,
+                                finish_reason,
+                            )
+                            first_business_frame_logged = True
+                        if finished:
+                            logging.info(
+                                "[terminal-probe] version=1 phase=dash_finished_frame_yield "
+                                "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                                "response_index=%d delta_len=%d finish_reason=%s",
+                                time.monotonic_ns() // 1000,
+                                rtp_llm_request_id,
+                                request.id,
+                                current_external_request_id,
+                                current_dash_response_index,
+                                delta_len,
+                                finish_reason,
+                            )
                         yield resp
+                        if finished:
+                            logging.info(
+                                "[terminal-probe] version=1 phase=dash_finished_frame_resumed "
+                                "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                                "response_index=%d finish_reason=%s",
+                                time.monotonic_ns() // 1000,
+                                rtp_llm_request_id,
+                                request.id,
+                                current_external_request_id,
+                                current_dash_response_index,
+                                finish_reason,
+                            )
                 finally:
+                    response_close_begin_us = time.monotonic_ns() // 1000
                     await response_iter.aclose()
+                    response_close_end_us = time.monotonic_ns() // 1000
+                    logging.info(
+                        "[terminal-probe] version=1 phase=dash_response_iter_closed "
+                        "mono_us=%d request=%d trace_id=%s external_request_id=%s "
+                        "response_count=%d close_us=%d",
+                        response_close_end_us,
+                        rtp_llm_request_id,
+                        request.id,
+                        current_external_request_id,
+                        dash_response_index,
+                        response_close_end_us - response_close_begin_us,
+                    )
                 return
             if first_request:
                 record.mark_request_done("eof")
@@ -2013,3 +2086,14 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     record.frontend_metric_state.finish()
                 finally:
                     _finish_server_trace(trace_state, record, exc)
+            logging.info(
+                "[terminal-probe] version=1 phase=dash_handler_return "
+                "mono_us=%d request=%s trace_id=%s external_request_id=%s "
+                "status=%s terminal_seen=%d",
+                time.monotonic_ns() // 1000,
+                current_rtp_llm_request_id,
+                current_trace_id,
+                current_external_request_id,
+                record.status,
+                1 if record.terminal_seen else 0,
+            )
