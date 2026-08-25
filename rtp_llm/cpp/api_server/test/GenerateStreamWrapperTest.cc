@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "rtp_llm/cpp/api_server/GenerateStreamWrapper.h"
+#include "rtp_llm/cpp/api_server/Exception.h"
 
 #include "rtp_llm/cpp/api_server/test/mock/MockEngineBase.h"
 #include "rtp_llm/cpp/api_server/test/mock/MockGenerateStream.h"
@@ -44,11 +45,9 @@ TEST_F(GenerateStreamWrapperTest, generateResponse) {
     EXPECT_CALL(*mock_engine_, enqueue(Matcher<const std::shared_ptr<GenerateInput>&>(_))).WillOnce(Return(stream));
 
     GenerateOutputs outputs;
-    EXPECT_CALL(*mock_stream, nextOutput())
+    EXPECT_CALL(*mock_stream, nextOutput(_))
         .WillOnce(Return(ErrorResult<GenerateOutputs>(std::move(outputs))))
-        .WillOnce(Return(ErrorResult<GenerateOutputs>(ErrorCode::OUTPUT_QUEUE_IS_EMPTY, "output queue is empty")));
-
-    EXPECT_CALL(*mock_stream, getStatus()).Times(2).WillRepeatedly(Return(StreamState::RUNNING));
+        .WillOnce(Return(ErrorResult<GenerateOutputs>(ErrorCode::FINISHED, "finished")));
 
     EXPECT_CALL(*mock_token_processor_, getTokenProcessorCtx(_, _, _)).WillOnce(Return(nullptr));
     EXPECT_CALL(*mock_token_processor_, decodeTokens(_, _, _, _)).WillOnce(Return(std::vector<std::string>()));

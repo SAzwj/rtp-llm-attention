@@ -104,7 +104,12 @@ public:
 
 protected:
     static grpc::Status responseStreamWriteFailedStatus();
-    grpc::Status        serializeErrorMsg(const std::string& request_key, ErrorInfo error_info);
+
+    virtual bool isCancelled(grpc::ServerContext* context) const {
+        return context->IsCancelled();
+    }
+
+    grpc::Status serializeErrorMsg(const std::string& request_key, ErrorInfo error_info);
     grpc::Status
          serializeErrorMsg(const std::string& request_key, const RequestInfo& request_info, ErrorInfo error_info);
     bool applyTimelineGate(const std::string& request_key,

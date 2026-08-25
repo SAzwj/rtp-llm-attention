@@ -1,6 +1,7 @@
 #pragma once
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <optional>
 
@@ -10,7 +11,6 @@ class NormalGenerateStream: public GenerateStream {
 public:
     NormalGenerateStream(const GenerateStream& stream): GenerateStream(stream) {
         CopyOnWrite(stream);
-        generate_outputs_queue_.setCapacity(1000);
     }
 
     NormalGenerateStream(const std::shared_ptr<GenerateInput>& query,
@@ -27,16 +27,10 @@ public:
                        metrics_reporter,
                        extra_reserve_token_num,
                        perf_test),
-        request_id_(query->request_id) {
-        generate_outputs_queue_.setCapacity(1000);
-    }
-
-    ~NormalGenerateStream() {
-        generate_outputs_queue_.wakeup();
-    }
+        request_id_(query->request_id) {}
 
     bool                         hasOutput() override;
-    ErrorResult<GenerateOutputs> nextOutput() override;
+    ErrorResult<GenerateOutputs> nextOutput(int64_t wait_timeout_ms = 0) override;
     void                         updateOutput(const StreamUpdateInfo& update_info) override;
 
 private:
@@ -44,17 +38,17 @@ private:
     GenerateOutputs prepareGenerateOutput(const StreamUpdateInfo& update_info);
     GenerateOutputs prepareFrontendMetricOutput();
     void            enqueueLatestFrontendMetricOutput(GenerateOutputs&& generate_results);
-    bool            hasPendingFrontendMetricOutput();
-    void            setPendingFrontendMetricTerminalError(bool pending);
     GenerateOutputs takeLatestFrontendMetricOutput(GenerateOutputs&& marker);
     void            enqueueGenerateOutput(GenerateOutputs&& generate_results);
+    bool            consumerReadyWithoutLock() const override;
 
-    int64_t                                   request_id_{0};
-    bool                                      finished_{false};
-    std::mutex                                frontend_metric_output_mutex_;
-    bool                                      frontend_metric_marker_pending_{false};
-    bool                                      frontend_metric_terminal_error_pending_{false};
-    std::optional<GenerateOutputs>            latest_frontend_metric_output_;
-    autil::SynchronizedQueue<GenerateOutputs> generate_outputs_queue_;
+    static constexpr size_t kOutputCapacity = 1000;
+
+    int64_t                        request_id_{0};
+    bool                           finished_{false};
+    bool                           frontend_metric_marker_pending_{false};
+    bool                           frontend_metric_terminal_error_pending_{false};
+    std::optional<GenerateOutputs> latest_frontend_metric_output_;
+    std::deque<GenerateOutputs>    generate_outputs_;
 };
 }  // namespace rtp_llm

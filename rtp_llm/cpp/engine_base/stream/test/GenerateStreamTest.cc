@@ -117,6 +117,16 @@ class GenerateStreamTest: public DeviceTestBase {
 protected:
 };
 
+template<typename T>
+void waitForConsumer(std::future<T>& future, const std::shared_ptr<NormalGenerateStream>& stream) {
+    const auto status = future.wait_for(std::chrono::seconds(5));
+    if (status != std::future_status::ready) {
+        stream->reportError(ErrorCode::EXECUTION_EXCEPTION, "test consumer timed out");
+    }
+    EXPECT_EQ(status, std::future_status::ready);
+    future.wait();
+}
+
 void updateOneToken(const GenerateStreamPtr& stream, int token_id) {
     const auto new_tokens = torch::full(
         {static_cast<int64_t>(stream->currentBatchSize()), 1}, token_id, torch::TensorOptions().dtype(torch::kInt32));
@@ -143,6 +153,99 @@ TEST_F(GenerateStreamTest, testConstruct) {
     auto builder = GenerateStreamBuilder();
     auto stream1 = builder.createContextStream({{1, 2, 3, 4, 5}, {}});
     auto stream2 = builder.createDecoderStream({1, 2, 3, 4, 5}, {1, 2, 3});
+}
+
+TEST_F(GenerateStreamTest, pendingCompletionWakesConsumerBeforeSchedulerCommit) {
+    auto stream =
+        std::dynamic_pointer_cast<NormalGenerateStream>(GenerateStreamBuilder().createContextStream({1, 2, 3}));
+    stream->generate_status_->status.store(StreamState::RUNNING);
+
+    std::promise<void> consumer_started;
+    auto               consumer_ready = consumer_started.get_future();
+    auto               consumer       = std::async(std::launch::async, [stream, &consumer_started] {
+        consumer_started.set_value();
+        return stream->nextOutput();
+    });
+    consumer_ready.get();
+
+    stream->reportEvent(StreamEvents::GenerateDone);
+    waitForConsumer(consumer, stream);
+    auto result = consumer.get();
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), ErrorCode::FINISHED);
+    EXPECT_EQ(stream->getStatus(), StreamState::RUNNING);
+}
+
+TEST_F(GenerateStreamTest, finalOutputIsDrainedBeforeCompletion) {
+    auto stream =
+        std::dynamic_pointer_cast<NormalGenerateStream>(GenerateStreamBuilder().createContextStream({1, 2, 3}));
+    stream->generate_status_->status.store(StreamState::RUNNING);
+
+    GenerateOutputs outputs;
+    outputs.request_id = 456;
+    {
+        std::lock_guard<std::mutex> lock(*stream->mutex_);
+        stream->enqueueGenerateOutput(std::move(outputs));
+        stream->reportEventWithoutLock(StreamEvents::GenerateDone);
+    }
+
+    auto output_result = stream->nextOutput();
+    ASSERT_TRUE(output_result.ok());
+    EXPECT_EQ(output_result.value().request_id, 456);
+
+    auto finished_result = stream->nextOutput();
+    ASSERT_FALSE(finished_result.ok());
+    EXPECT_EQ(finished_result.status().code(), ErrorCode::FINISHED);
+}
+
+TEST_F(GenerateStreamTest, positiveWaitTimeoutReturnsNoUpdate) {
+    auto stream =
+        std::dynamic_pointer_cast<NormalGenerateStream>(GenerateStreamBuilder().createContextStream({1, 2, 3}));
+
+    auto result = stream->nextOutput(1);
+
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), ErrorCode::OUTPUT_QUEUE_NO_UPDATE);
+    EXPECT_TRUE(stream->statusInfo().ok());
+    EXPECT_EQ(stream->getStatus(), StreamState::WAITING);
+}
+
+TEST_F(GenerateStreamTest, consumerWaitWakesOnError) {
+    auto stream =
+        std::dynamic_pointer_cast<NormalGenerateStream>(GenerateStreamBuilder().createContextStream({1, 2, 3}));
+
+    std::promise<void> consumer_started;
+    auto               consumer_ready = consumer_started.get_future();
+    auto               consumer       = std::async(std::launch::async, [stream, &consumer_started] {
+        consumer_started.set_value();
+        return stream->nextOutput();
+    });
+    consumer_ready.get();
+    stream->reportError(ErrorCode::CANCELLED, "cancelled");
+
+    waitForConsumer(consumer, stream);
+    auto result = consumer.get();
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), ErrorCode::CANCELLED);
+}
+
+TEST_F(GenerateStreamTest, consumerWaitWakesOnRemoteHandoff) {
+    auto stream =
+        std::dynamic_pointer_cast<NormalGenerateStream>(GenerateStreamBuilder().createContextStream({1, 2, 3}));
+
+    std::promise<void> consumer_started;
+    auto               consumer_ready = consumer_started.get_future();
+    auto               consumer       = std::async(std::launch::async, [stream, &consumer_started] {
+        consumer_started.set_value();
+        return stream->nextOutput();
+    });
+    consumer_ready.get();
+    stream->reportEvent(StreamEvents::NeedRemoteGenerate);
+
+    waitForConsumer(consumer, stream);
+    auto result = consumer.get();
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), ErrorCode::FINISHED);
 }
 
 TEST_F(GenerateStreamTest, testAuxInfoKeepsIndependentReturnSequenceLengths) {

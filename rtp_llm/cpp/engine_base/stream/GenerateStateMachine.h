@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
@@ -25,11 +27,12 @@ public:
 
     // 统一的事件上报接口
     // 注意：此方法非线程安全，外部应当仅通过GenerateStream在持锁路径下调用
+    template<typename T = std::string>
     void reportEvent(StreamEvents::EventType event,
                      ErrorCode               error_code = ErrorCode::NONE_ERROR,
-                     const std::string&      error_msg  = "") {
+                     T&&                     error_msg  = std::decay_t<T>{}) {
         if (error_info.ok() && event == StreamEvents::Error) {
-            error_info = ErrorInfo(error_code, error_msg);
+            error_info = ErrorInfo(error_code, std::forward<T>(error_msg));
         }
         events_.append(event);
     }
@@ -43,6 +46,16 @@ public:
 
     StreamState getStatus() const {
         return status.load(std::memory_order_acquire);
+    }
+
+    // Make terminal events visible to consumers before the scheduler commits
+    // the corresponding FINISHED lifecycle transition.
+    bool checkFinished() const {
+        const auto committed = status.load(std::memory_order_acquire);
+        if (committed == StreamState::FINISHED || events_.has(StreamEvents::Error)) {
+            return true;
+        }
+        return committed == StreamState::RUNNING && events_.has(StreamEvents::GenerateDone);
     }
 
     void setReserveStep(size_t reserve_step) {

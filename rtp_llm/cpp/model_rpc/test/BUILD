@@ -41,11 +41,21 @@ test_deps = [
     "//rtp_llm/cpp/config:config_modules",
     "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_cc_proto",
     "//rtp_llm/cpp/model_rpc:model_rpc_server",
+    "//rtp_llm/cpp/normal_engine:normal_engine",
     "@com_google_googletest//:gtest",
     "@com_google_googletest//:gtest_main",
     "@havenask//aios/autil:base64",
     "@havenask//aios/autil:zlib",
 ] + torch_deps() + device_impl_target()
+
+cc_test(
+    name = "local_rpc_server_test",
+    srcs = ["LocalRpcServerTest.cc"],
+    copts = test_copts,
+    deps = test_deps + cuda13_torch_link_deps,
+    env = {},
+    exec_properties = {'gpu':'H20'},
+)
 
 # cc_test(
 #     name = "model_rpc_server_test",
