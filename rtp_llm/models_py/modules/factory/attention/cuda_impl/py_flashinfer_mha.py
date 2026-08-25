@@ -756,6 +756,13 @@ class PyFlashinferDecodeImpl(FMHAImplBase):
         self.rope_params = self.rope_impl.prepare(attn_inputs)
         self.write_cache_store_impl = common.create_write_cache_store_impl(attn_inputs)
 
+    def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs) -> None:
+        self.fmha_impl.prepare_for_cuda_graph_replay(attn_inputs)
+        new_rope_params = self.rope_impl.prepare(attn_inputs)
+        common.copy_kv_cache_offset(
+            self.rope_params.kv_cache_offset, new_rope_params.kv_cache_offset
+        )
+
     @classmethod
     def support(
         cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs

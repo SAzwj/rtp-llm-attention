@@ -10,14 +10,48 @@ from base_attention_test import BaseAttentionTest, compare_tensors
 
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
     PyFlashinferDecodeAttnOp,
+    PyFlashinferDecodeImpl,
 )
-from rtp_llm.ops.compute_ops import PyAttentionInputs, fill_mla_params, get_typemeta
+from rtp_llm.ops.compute_ops import (
+    PyAttentionInputs,
+    fill_mla_params,
+    get_typemeta,
+    rtp_llm_ops,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 class TestPyFlashinferDecodeAttnOp(BaseAttentionTest):
     """Test suite for PyFlashinferDecodeAttnOp with correctness verification"""
+
+    def test_device_planner_accepts_undefined_prefix_lengths(self):
+        params = rtp_llm_ops.FlashInferMlaAttnParams()
+        params.fill_params_mha_device(
+            None,
+            torch.tensor([63, 128], dtype=torch.int32, device=self.device),
+            torch.ones(2, dtype=torch.int32, device=self.device),
+            torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=self.device),
+            64,
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(params.decode_page_indptr_d.cpu().tolist(), [0, 1, 4])
+        self.assertEqual(params.paged_kv_last_page_len_d.cpu().tolist(), [64, 1])
+        self.assertEqual(params.page_indice_d[:4].cpu().tolist(), [0, 3, 4, 5])
+
+    def test_decode_impl_supports_cuda_graph(self):
+        config = self._create_config()
+        attn_inputs = self._create_attention_inputs(
+            batch_size=1,
+            sequence_lengths=[128],
+            seq_size_per_block=config.seq_size_per_block,
+        )
+
+        impl = PyFlashinferDecodeImpl(config.attn_configs, attn_inputs)
+
+        self.assertTrue(impl.support_cuda_graph())
+        self.assertTrue(callable(getattr(impl, "prepare_cuda_graph", None)))
 
     def _create_attention_inputs(
         self,

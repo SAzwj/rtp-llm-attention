@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <numeric>
+#include <optional>
 #include <cuda_runtime.h>
 using namespace torch_ext;
 
@@ -845,13 +846,13 @@ void registerPyFlashInferMlaParams(pybind11::module& m) {
         .def(
             "fill_params_mha_device",
             [](rtp_llm::FlashInferMlaAttnParams& self,
-               torch::Tensor                     prefix_lengths,
+               std::optional<torch::Tensor>      prefix_lengths,
                torch::Tensor                     sequence_lengths,
                torch::Tensor                     input_lengths,
                torch::Tensor                     kv_cache_block_id_device,
                int                               seq_size_per_block,
                bool                              forbid_realloc) {
-                self.fillParamsMhaDevice(prefix_lengths,
+                self.fillParamsMhaDevice(prefix_lengths.value_or(torch::Tensor()),
                                          sequence_lengths,
                                          input_lengths,
                                          kv_cache_block_id_device,
