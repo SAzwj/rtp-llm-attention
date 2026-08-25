@@ -826,8 +826,18 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
     if (!enable_cuda_graph_) {
         return false;
     }
-    const bool target_verify_decode = is_target_verify_ || inputs.attention_inputs.is_target_verify;
-    if (inputs.attention_inputs.is_prefill && !is_prefill_cuda_graph_mode_ && !target_verify_decode) {
+
+    if (is_target_verify_) {
+        if (!inputs.attention_inputs.is_target_verify) {
+            return false;
+        }
+        if (!inputs.attention_inputs.is_prefill) {
+            RTP_LLM_LOG_WARNING("Target-verify CUDA graph requires prefill attention inputs, fallback to normal run.");
+            return false;
+        }
+    }
+
+    if (!is_target_verify_ && inputs.attention_inputs.is_prefill && !is_prefill_cuda_graph_mode_) {
         return false;
     }
 
@@ -841,6 +851,10 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
                                 "Hybrid kv cache group size mismatch: inputs=%zu, captured=%d",
                                 group,
                                 kv_cache_group_num_);
+    }
+
+    if (is_target_verify_) {
+        return tryGetRealGraphDecodeBatchSize(inputs, state);
     }
 
     if (is_prefill_cuda_graph_mode_) {

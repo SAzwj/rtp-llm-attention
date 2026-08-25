@@ -59,6 +59,23 @@ py_test(
 )
 
 py_test(
+    name = "cuda_graph_target_verify_gate_test",
+    srcs = ["cuda_graph_target_verify_gate_test.py"],
+    data = [
+        ":test_cuda_graph_runner",
+        "//:th_transformer",
+    ],
+    deps = [
+        "//rtp_llm:ops",
+    ],
+    env = {
+        "TEST_USING_DEVICE": "CUDA",
+    },
+    tags = ["H20"],
+    exec_properties = {"gpu": "H20"},
+)
+
+py_test(
     name = "cuda_graph_prefill",
     srcs = [
         "cuda_graph_prefill.py",
