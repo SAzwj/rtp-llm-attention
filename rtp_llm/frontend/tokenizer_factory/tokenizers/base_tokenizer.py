@@ -1,7 +1,10 @@
 import functools
+import hashlib
 import json
 import logging
 import os
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 
@@ -26,7 +29,45 @@ class BaseTokenizer:
         tokenizer_config = self._load_tokenizer_config(tokenizer_path)
         extra_kwargs = self._transformers_v5_kwargs(tokenizer_config, tokenizer_obj)
         extra_kwargs.update(self._additional_kwargs(tokenizer_config))
+        tokenizer_auto_map = tokenizer_config.get("auto_map")
+        has_remote_tokenizer = isinstance(tokenizer_auto_map, (list, tuple))
+        if isinstance(tokenizer_auto_map, dict):
+            has_remote_tokenizer = tokenizer_auto_map.get("AutoTokenizer") is not None
+        lock_fd = None
+        file_lock = None
         try:
+            if has_remote_tokenizer:
+                import fcntl
+
+                from transformers.utils.hub import HF_MODULES_CACHE
+
+                cache_root = Path(HF_MODULES_CACHE).expanduser().resolve()
+                resolved_tokenizer_path = Path(tokenizer_path).expanduser().resolve()
+                lock_scope = b"\0".join(
+                    (os.fsencode(cache_root), os.fsencode(resolved_tokenizer_path))
+                )
+                lock_key = hashlib.sha256(lock_scope).hexdigest()
+                fallback_lock_dir = Path(tempfile.gettempdir()).joinpath(
+                    f"rtp_llm_tokenizer_locks_{os.getuid()}"
+                )
+                lock_dirs = (
+                    cache_root / ".rtp_llm_tokenizer_locks",
+                    fallback_lock_dir,
+                )
+                for lock_dir in lock_dirs:
+                    try:
+                        lock_dir.mkdir(parents=True, exist_ok=True)
+                        lock_fd = os.open(
+                            lock_dir / f"{lock_key}.lock",
+                            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                            0o666,
+                        )
+                        break
+                    except OSError:
+                        if lock_dir == lock_dirs[-1]:
+                            raise
+                file_lock = fcntl
+                file_lock.flock(lock_fd, file_lock.LOCK_EX)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_path,
                 trust_remote_code=True,
@@ -40,6 +81,12 @@ class BaseTokenizer:
                 f"extra_kwargs={extra_kwargs}: {e}"
             )
             raise
+        finally:
+            if lock_fd is not None:
+                try:
+                    file_lock.flock(lock_fd, file_lock.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
         self._fix_post_processor(tokenizer_obj, extra_kwargs)
 
     def _additional_kwargs(self, tokenizer_config: Dict[str, Any]) -> Dict[str, Any]:

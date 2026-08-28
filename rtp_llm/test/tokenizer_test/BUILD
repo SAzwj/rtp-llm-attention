@@ -32,3 +32,13 @@ py_test(
         "//rtp_llm:testlib",
     ]
 )
+
+py_test(
+    name = "base_tokenizer_cache_lock_test",
+    srcs = [
+        "base_tokenizer_cache_lock_test.py",
+    ],
+    data = [
+        "//rtp_llm:frontend/tokenizer_factory/tokenizers/base_tokenizer.py",
+    ],
+)
