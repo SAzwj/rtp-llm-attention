@@ -21,6 +21,7 @@ import org.flexlb.dao.route.RoleType;
 import org.flexlb.enums.DecodeTaskPhase;
 import org.flexlb.service.monitor.BatchSchedulerReporter;
 import org.flexlb.service.monitor.PrioritySchedulerReporter;
+import org.flexlb.telemetry.FlexlbTrace;
 import org.flexlb.util.CommonUtils;
 import org.flexlb.util.Logger;
 import org.flexlb.util.PriorityNormalizer;
@@ -1049,6 +1050,14 @@ public class PriorityAdmissionScheduler {
 
         ServerStatus prefill = FlexlbBatchScheduler.findServer(routeResponse, RoleType.PREFILL);
         ServerStatus decode = FlexlbBatchScheduler.findServer(routeResponse, RoleType.DECODE);
+        if (prefill != null) {
+            FlexlbTrace.setScheduleAttribute(ctx.getTraceContext(), FlexlbTrace.PREFILL_ADDRESS,
+                    prefill.getServerIp() + ":" + prefill.getHttpPort());
+        }
+        if (decode != null) {
+            FlexlbTrace.setScheduleAttribute(ctx.getTraceContext(), FlexlbTrace.DECODE_ADDRESS,
+                    decode.getServerIp() + ":" + decode.getHttpPort());
+        }
         if (prefill == null) {
             rollbackRoute(routeResponse);
             return PlacementOutcome.infeasible(null);

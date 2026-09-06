@@ -124,6 +124,11 @@ RTP_LLM_POLL_LOCAL_OUTPUT_RT_US = "rtp_llm.poll_local_output_rt_us"
 RTP_LLM_POLL_REMOTE_OUTPUT_RT_US = "rtp_llm.poll_remote_output_rt_us"
 # True only when a failed request cuts off a phase before its natural end.
 RTP_LLM_PHASE_TRUNCATED = "rtp_llm.phase.truncated"
+# Frontend-to-prefill handoff delay on the master coalescing path, covering the
+# FlexLB coalescing wait plus both network hops. Written by the C++ prefill node
+# only; it subtracts two machines' wall clocks, so it is an approximation
+# subject to NTP skew rather than a precise latency metric.
+RTP_LLM_PREFILL_HANDOFF_DELAY_US = "rtp_llm.prefill_handoff_delay_us"
 
 # --- HTTP semconv (root SERVER span only). Platform views read the two
 # semconv generations with inconsistent priority, and the HTTP-error counter
