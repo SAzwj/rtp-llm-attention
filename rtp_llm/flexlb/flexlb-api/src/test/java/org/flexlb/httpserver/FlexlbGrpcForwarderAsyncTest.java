@@ -172,11 +172,11 @@ class FlexlbGrpcForwarderAsyncTest {
         final OpenTelemetrySdk sdk;
 
         TraceCapture() {
-            FlexlbTrace.configureEnabled(true);
             GlobalOpenTelemetry.resetForTest();
             sdk = OpenTelemetrySdk.builder().setTracerProvider(SdkTracerProvider.builder()
                     .addSpanProcessor(SimpleSpanProcessor.create(this)).build()).build();
             GlobalOpenTelemetry.set(sdk);
+            FlexlbTrace.configure(sdk, "");
         }
 
         SpanData client() {
@@ -192,7 +192,7 @@ class FlexlbGrpcForwarderAsyncTest {
         public CompletableResultCode flush() { return CompletableResultCode.ofSuccess(); }
         public CompletableResultCode shutdown() { return CompletableResultCode.ofSuccess(); }
         public void close() {
-            FlexlbTrace.configureEnabled(false);
+            FlexlbTrace.configure(null, "");
             sdk.close();
             GlobalOpenTelemetry.resetForTest();
         }

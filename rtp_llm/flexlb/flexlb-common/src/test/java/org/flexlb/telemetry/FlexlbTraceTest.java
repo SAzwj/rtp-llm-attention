@@ -44,7 +44,6 @@ class FlexlbTraceTest {
 
     @BeforeEach
     void setUp() {
-        FlexlbTrace.configureEnabled(true);
         GlobalOpenTelemetry.resetForTest();
         exporter = new RecordingExporter();
         SdkTracerProvider provider = SdkTracerProvider.builder()
@@ -57,18 +56,19 @@ class FlexlbTraceTest {
                         W3CTraceContextPropagator.getInstance()))
                 .build();
         GlobalOpenTelemetry.set(sdk);
+        FlexlbTrace.configure(sdk, "");
     }
 
     @AfterEach
     void tearDown() {
-        FlexlbTrace.configureEnabled(false);
+        FlexlbTrace.configure(null, "");
         sdk.close();
         GlobalOpenTelemetry.resetForTest();
     }
 
     @Test
     void disabledManualTracingPreservesPropagationWithoutTouchingExternalSpan() {
-        FlexlbTrace.configureEnabled(false);
+        FlexlbTrace.configure(null, "");
         Span owner = sdk.getTracer("external").spanBuilder("owner").startSpan();
         try {
             Context context = Context.root().with(owner);

@@ -1,6 +1,6 @@
 package org.flexlb.telemetry;
 
-import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanBuilder;
 import io.opentelemetry.api.trace.SpanContext;
@@ -24,10 +24,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Small fail-open facade for the FlexLB manual tracing points.
  *
- * <p>When RTP_LLM_OTEL_TRACE_ENABLE is enabled, the FlexLB application enables
- * the SDK provider before Spring starts. An external instrumentation provider
- * may supply it instead. The manual tracing switch is independent of provider
- * ownership; when disabled, only W3C propagation remains active.</p>
+ * <p>由启动器注入自有 SDK，不读取全局 Provider 或 JVM 配置；关闭时仍可传播 W3C 上下文。</p>
  */
 public final class FlexlbTrace {
 
@@ -70,13 +67,17 @@ public final class FlexlbTrace {
     private static final Map<Span, BusinessError> BUSINESS_ERRORS =
             Collections.synchronizedMap(new WeakHashMap<>());
     private static volatile boolean enabled;
+    private static volatile Tracer tracer = OpenTelemetry.noop().getTracer(INSTRUMENTATION_NAME);
 
     private FlexlbTrace() {
     }
 
-    /** Configured at startup, before requests; does not initialize or own a provider. */
-    public static void configureEnabled(boolean value) {
-        enabled = value;
+    /** 完整初始化成功后注入 Provider；null 表示关闭。 */
+    public static void configure(OpenTelemetry sdk, String scopeVersion) {
+        enabled = false;
+        tracer = sdk == null ? OpenTelemetry.noop().getTracer(INSTRUMENTATION_NAME)
+                : sdk.getTracer(INSTRUMENTATION_NAME, scopeVersion);
+        enabled = sdk != null;
     }
 
     public static boolean isEnabled() {
@@ -323,7 +324,7 @@ public final class FlexlbTrace {
             return null;
         }
         try {
-            Tracer tracer = GlobalOpenTelemetry.getTracer(INSTRUMENTATION_NAME);
+            Tracer tracer = FlexlbTrace.tracer;
             SpanBuilder builder = tracer.spanBuilder(name).setSpanKind(kind);
             if (parent == null) {
                 builder.setParent(Context.current());
