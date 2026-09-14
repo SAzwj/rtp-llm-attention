@@ -65,7 +65,7 @@ class FlexlbServiceImplTest {
 
     @BeforeEach
     void setUp() {
-        org.flexlb.telemetry.FlexlbTrace.configureEnabled(true);
+        org.flexlb.telemetry.FlexlbTrace.configure(io.opentelemetry.api.OpenTelemetry.noop(), "");
         routeService = mock(RouteService.class);
         lbStatusConsistencyService = mock(LBStatusConsistencyService.class);
         engineHealthReporter = mock(EngineHealthReporter.class);
@@ -101,7 +101,7 @@ class FlexlbServiceImplTest {
 
     @AfterEach
     void tearDown() {
-        org.flexlb.telemetry.FlexlbTrace.configureEnabled(false);
+        org.flexlb.telemetry.FlexlbTrace.configure(null, "");
         pvLogger.detachAppender(pvAppender);
         pvAppender.stop();
     }
@@ -613,6 +613,7 @@ class FlexlbServiceImplTest {
         io.opentelemetry.sdk.OpenTelemetrySdk sdk =
                 io.opentelemetry.sdk.OpenTelemetrySdk.builder().setTracerProvider(provider).build();
         io.opentelemetry.api.GlobalOpenTelemetry.set(sdk);
+        org.flexlb.telemetry.FlexlbTrace.configure(sdk, "");
         try {
             io.opentelemetry.api.trace.Span serverSpan =
                     org.flexlb.telemetry.FlexlbTrace.startServer(
@@ -661,6 +662,7 @@ class FlexlbServiceImplTest {
                             io.opentelemetry.api.common.AttributeKey.longKey("flexlb.schedule.code")));
             assertTrue(span.getEvents().isEmpty());
         } finally {
+            org.flexlb.telemetry.FlexlbTrace.configure(null, "");
             sdk.close();
             io.opentelemetry.api.GlobalOpenTelemetry.resetForTest();
         }
