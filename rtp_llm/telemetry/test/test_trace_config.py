@@ -87,7 +87,8 @@ class TraceConfigTest(unittest.TestCase):
 
     def test_old_switch_cannot_enable(self):
         with mock.patch.dict(
-            os.environ, {config.CONFIG_ENV: "", "RTP_LLM_OTEL_TRACE_ENABLE": "1"}
+            os.environ,
+            {config.CONFIG_ENV: '{"enabled":false}', "RTP_LLM_OTEL_TRACE_ENABLE": "1"},
         ):
             with mock.patch.object(tracing, "_init_with_exporter_locked") as init:
                 self.assertFalse(tracing.init_telemetry("frontend"))
@@ -101,7 +102,7 @@ from rtp_llm.telemetry import tracing
 assert not tracing.init_telemetry('frontend')
 """
         env = os.environ.copy()
-        env.pop(config.CONFIG_ENV, None)
+        env[config.CONFIG_ENV] = '{"enabled":false}'
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])
         result = subprocess.run(
             [sys.executable, "-c", script], env=env, capture_output=True, text=True

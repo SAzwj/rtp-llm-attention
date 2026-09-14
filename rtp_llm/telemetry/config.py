@@ -162,13 +162,21 @@ def _endpoint(value: str) -> None:
 
 def parse_trace_config(raw: Optional[str], tp_rank: int = 0) -> TraceConfig:
     """纯解析入口；异常只含安全错误码。非负责 rank 不读取区域文件。"""
-    if not raw or not raw.strip():
-        return TraceConfig()
+    if not raw or not raw.strip() or raw.strip() == "{}":
+        if tp_rank != 0:
+            return TraceConfig()
+        return TraceConfig(
+            True,
+            1.0,
+            "http://127.0.0.1:4318/v1/traces",
+            {"x-trace-test": "temporary"},
+            source="temporary",
+        )
     values = _decode(raw)
     if values.keys() - _FIELDS:
         raise TraceConfigError("config", "unknown_field")
     strings = {name: _string(values.get(name, ""), name) for name in _STRING_FIELDS}
-    enabled = values.get("enabled", False)
+    enabled = values.get("enabled", True)
     if type(enabled) is not bool:
         raise TraceConfigError("enabled", "expected_boolean")
     if not enabled or tp_rank != 0:

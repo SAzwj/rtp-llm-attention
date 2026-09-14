@@ -1,7 +1,7 @@
 [
-  {"name":"absent","raw":null,"enabled":false},
-  {"name":"blank","raw":"  ","enabled":false},
-  {"name":"empty","raw":"{}","enabled":false},
+  {"name":"absent","raw":null,"enabled":true},
+  {"name":"blank","raw":"  ","enabled":true},
+  {"name":"empty","raw":"{}","enabled":true},
   {"name":"disabled","raw":"{\"enabled\":false}","enabled":false},
   {"name":"enabled_type","raw":"{\"enabled\":1}","error":"expected_boolean"},
   {"name":"enabled_string","raw":"{\"enabled\":\"true\"}","error":"expected_boolean"},

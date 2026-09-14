@@ -53,9 +53,14 @@ record TraceConfig(boolean enabled, double samplerRatio, String endpoint, Map<St
         return new TraceConfig(false, 1.0, "", Map.of(), "", "", "", 2048, 512, 5000, 3000, "disabled");
     }
 
+    static TraceConfig defaultEnabled() {
+        return new TraceConfig(true, 1.0, "http://127.0.0.1:4318/v1/traces",
+                Map.of("x-trace-test", "temporary"), "", "", "", 2048, 512, 5000, 3000, "temporary");
+    }
+
     static TraceConfig parse(String raw) {
-        if (raw == null || raw.isBlank()) {
-            return disabled();
+        if (raw == null || raw.isBlank() || raw.strip().equals("{}")) {
+            return defaultEnabled();
         }
         JsonNode root = decode(raw);
         root.fieldNames().forEachRemaining(name -> {
@@ -67,7 +72,7 @@ record TraceConfig(boolean enabled, double samplerRatio, String endpoint, Map<St
         if (enabledNode != null && !enabledNode.isBoolean()) {
             throw new ConfigException("enabled", "expected_boolean");
         }
-        boolean enabled = enabledNode != null && enabledNode.booleanValue();
+        boolean enabled = enabledNode == null || enabledNode.booleanValue();
         if (!enabled) {
             return disabled();
         }

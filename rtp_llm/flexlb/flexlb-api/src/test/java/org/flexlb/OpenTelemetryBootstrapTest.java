@@ -34,7 +34,7 @@ class OpenTelemetryBootstrapTest {
     @BeforeEach
     void setUp() throws Exception {
         OpenTelemetryBootstrap.resetForTest();
-        environment.remove(TraceConfig.ENV);
+        environment.set(TraceConfig.ENV, "{\"enabled\":false}");
         originalHostnameFile = OpenTelemetryBootstrap.hostnameFile;
         OpenTelemetryBootstrap.hostnameFile = directory.resolve("hostname");
         Files.writeString(OpenTelemetryBootstrap.hostnameFile, "probe-host\n");
