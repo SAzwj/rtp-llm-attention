@@ -4634,20 +4634,15 @@ class DashScInferenceTracingTest(unittest.IsolatedAsyncioTestCase):
         span = self._finished_spans()[-1]
         self.assertEqual(span.name, "dash_sc.ModelStreamInfer")
         self.assertEqual(span.status.status_code.name, "ERROR")
-        self.assertEqual(span.attributes["error.type"], "BACKEND_RuntimeError")
+        self.assertEqual(span.attributes["error.type"], "DASH_ERROR_19")
 
     async def test_prologue_reporting_failure_still_ends_server_span(self) -> None:
-        """A throwing arrival metric must not leak the SERVER span.
-
-        ``report_arrival`` reaches kmonitor, which has no exception guard of its
-        own, so it runs inside the handler ``try``: the ``finally`` still ends the
-        span and clears CURRENT_TRACE_STATE.
-        """
+        """A throwing query logger must not leak the SERVER span."""
         servicer = DashScInferenceServicer(
             backend_visitor=self._ClientSpanVisitor(self._terminal_stream)
         )
         with patch(
-            "rtp_llm.dash_sc.inference.servicer.report_arrival",
+            "rtp_llm.dash_sc.inference.servicer.emit_query_log",
             side_effect=RuntimeError("kmonitor down"),
         ):
             with self.assertRaises(RuntimeError):

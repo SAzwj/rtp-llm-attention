@@ -24,7 +24,6 @@ import org.flexlb.consistency.LBStatusConsistencyService;
 import org.flexlb.interceptor.GrpcTraceInterceptor;
 import org.flexlb.schedule.grpc.FlexlbScheduleProtocol;
 import org.flexlb.schedule.grpc.FlexlbServiceGrpc;
-import org.flexlb.schedule.grpc.FlexlbScheduleProtocol;
 import org.flexlb.service.monitor.EngineHealthReporter;
 import org.flexlb.telemetry.FlexlbTrace;
 import org.junit.jupiter.api.Test;
@@ -140,7 +139,7 @@ class FlexlbGrpcForwarderAsyncTest {
 
     @Test
     @Timeout(value = 10, unit = TimeUnit.SECONDS)
-    void compensatingCancelKeepsExplicitTraceOutsideCancelledGrpcContext() throws Exception {
+    void cancelForwardKeepsTraceParent() throws Exception {
         try (TraceCapture capture = new TraceCapture();
              RpcFixture fixture = RpcFixture.startCancel((request, observer) -> {
                  assertFalse(Context.current().isCancelled());
@@ -150,11 +149,12 @@ class FlexlbGrpcForwarderAsyncTest {
                  observer.onCompleted();
              })) {
             FlexlbGrpcForwarder forwarder = forwarder(fixture.channel, mock(EngineHealthReporter.class));
-            Context.CancellableContext cancelled = Context.current().withCancellation();
-            cancelled.cancel(null);
-            var result = cancelled.call(() -> Context.ROOT.call(() -> forwarder.forwardCompensatingCancelToMaster(
-                    FlexlbScheduleProtocol.FlexlbCancelRequestPB.newBuilder().setRequestId(903L).build(),
-                    MASTER_HTTP_ADDRESS, traceParent()))).toCompletableFuture().get(3, TimeUnit.SECONDS);
+            FlexlbGrpcForwarder.CancelForwardResult result;
+            try (var scope = traceParent().makeCurrent()) {
+                result = forwarder.forwardCancelToMaster(
+                        FlexlbScheduleProtocol.FlexlbCancelRequestPB.newBuilder().setRequestId(903L).build())
+                        .toCompletableFuture().get(3, TimeUnit.SECONDS);
+            }
             assertTrue(result.response().getFound());
             assertTrue(capture.ended.await(3, TimeUnit.SECONDS));
             assertEquals("rtp_llm.flexlb.cancel", capture.client().getName());

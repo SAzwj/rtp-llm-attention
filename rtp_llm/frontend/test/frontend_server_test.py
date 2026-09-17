@@ -89,7 +89,15 @@ class FrontendServerTest(TestCase):
         )
         self.frontend_server._frontend_worker = FakeFrontendWorker()
 
+    def setUp(self):
+        from rtp_llm.telemetry.tracing import reset_telemetry_for_test
+
+        reset_telemetry_for_test()
+
     def tearDown(self):
+        from rtp_llm.telemetry.tracing import reset_telemetry_for_test
+
+        reset_telemetry_for_test()
         self.frontend_server._request_metrics.close()
 
     async def _async_run(self, *args: Any, **kwargs: Any):
@@ -453,7 +461,7 @@ class FrontendServerTest(TestCase):
         )
         try:
 
-            async def _boom(req, raw_request, generate_call):
+            async def _boom(req, raw_request, generate_call, metric_tags):
                 raise RuntimeError("engine exploded")
 
             original_impl = self.frontend_server._infer_impl
@@ -464,7 +472,7 @@ class FrontendServerTest(TestCase):
                     state = tracing.start_server_span("POST /v1/chat/completions", {})
                     self.assertIsNotNone(state)
                     rep = await self.frontend_server._infer_wrap(
-                        {request_id_field_name: 1}, None, None
+                        {request_id_field_name: 1}, None, None, {}
                     )
                     self.assertEqual(rep.status_code, 500)
                     # the follow-up success-path finish() must stay a no-op

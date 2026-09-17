@@ -13,8 +13,7 @@ public:
     explicit RuntimeMetaTestStream(const std::shared_ptr<GenerateInput>& input):
         GenerateStream(input, modelConfig(), RuntimeConfig{}, ResourceContext{}, nullptr) {}
 
-    ErrorResult<GenerateOutputs> nextOutput(int64_t wait_timeout_ms = 0) override {
-        (void)wait_timeout_ms;
+    ErrorResult<GenerateOutputs> nextOutput() override {
         return ErrorResult<GenerateOutputs>(GenerateOutputs{});
     }
 

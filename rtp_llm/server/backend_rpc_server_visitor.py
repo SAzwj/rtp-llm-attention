@@ -521,6 +521,7 @@ class BackendRPCServerVisitor:
                     input_token_batched = True
 
                 master_route_result: Optional[FlexlbResponse] = None
+                master_route_succeeded = False
                 if not role_addrs_specified and master_addr and not input_token_batched:
                     with Timer() as master_route_timer:
                         master_route_result = await self.get_master_route_addrs(input)
@@ -529,6 +530,7 @@ class BackendRPCServerVisitor:
                         master_route_timer.cost_ms(),
                     )
                     if master_route_result is None:
+                        master_route_succeeded = True
                         route_source = "master"
                 elif not role_addrs_specified:
                     route_logger.warning(
@@ -554,7 +556,15 @@ class BackendRPCServerVisitor:
                         GaugeMetrics.DOMAIN_ROUTE_RT_METRIC,
                         domain_route_timer.cost_ms(),
                     )
-                    route_source = "domain_fallback"
+                    route_source = (
+                        "request+domain_fallback"
+                        if role_addrs_specified
+                        else (
+                            "master+domain_fallback"
+                            if master_route_succeeded
+                            else "domain_fallback"
+                        )
+                    )
                 route_logger.debug("routing to master done")
 
             kmonitor.report(GaugeMetrics.ROUTE_RT_METRIC, route_timer.cost_ms())
@@ -574,6 +584,15 @@ class BackendRPCServerVisitor:
         except BaseException as e:
             if route_span is not None:
                 route_span.set_attribute(trace_attrs.RTP_LLM_ROUTE_SOURCE, route_source)
+                if isinstance(e, asyncio.CancelledError):
+                    route_error_type = "Cancelled"
+                elif isinstance(e, FtRuntimeException):
+                    route_span.set_attribute(
+                        trace_attrs.RTP_LLM_ERROR_CODE,
+                        int(getattr(e, "rtp_error_code", e.exception_type)),
+                    )
+                    if not route_error_type:
+                        route_error_type = "RouteError"
                 route_span.finish(error=e, error_type=route_error_type)
             raise
         if route_span is not None:

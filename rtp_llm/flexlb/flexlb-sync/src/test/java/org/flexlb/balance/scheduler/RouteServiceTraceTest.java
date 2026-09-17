@@ -1,11 +1,10 @@
 package org.flexlb.balance.scheduler;
 
-import com.google.protobuf.ByteString;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.context.Context;
 import org.flexlb.config.ConfigService;
 import org.flexlb.config.FlexlbConfig;
-import org.flexlb.config.SchedulerConfig;
+import org.flexlb.config.DirectSchedulerConfig;
 import org.flexlb.dao.BalanceContext;
 import org.flexlb.dao.loadbalance.Request;
 import org.flexlb.dao.loadbalance.Response;
@@ -45,7 +44,7 @@ class RouteServiceTraceTest {
         for (String mode : new String[] {"DIRECT", "QUEUE", "BATCH"}) {
             FlexlbConfig config = new FlexlbConfig();
             if (mode.equals("DIRECT")) {
-                config.setScheduler(SchedulerConfig.direct());
+                config.setScheduler(new DirectSchedulerConfig());
                 SchedulingTestConfig.useNonBatchDispatcher(config);
             } else {
                 SchedulingTestConfig.useFifoQueue(config);
@@ -57,20 +56,20 @@ class RouteServiceTraceTest {
             }
             ConfigService configs = mock(ConfigService.class);
             when(configs.loadBalanceConfig()).thenReturn(config);
-            RequestScheduler scheduler = mock(RequestScheduler.class);
+            PriorityScheduler scheduler = mock(PriorityScheduler.class);
             DefaultRouter router = mock(DefaultRouter.class);
             CompletableFuture<Response> pending = new CompletableFuture<>();
             when(scheduler.submit(any())).thenReturn(pending);
             Response response = new Response();
             response.setSuccess(true);
-            when(router.routeDirect(any())).thenReturn(response);
+            when(router.route(any())).thenReturn(response);
             RouteService service = new RouteService(configs, router, scheduler,
                     mock(RecentCacheKeyTraceReporter.class));
             BalanceContext ctx = new BalanceContext();
             Request request = new Request();
             request.setRequestId(700L);
             ctx.setRequest(request);
-            ctx.setGenerateInputPb(ByteString.copyFromUtf8("input"));
+            ctx.setGenerateInputPbBytes(new byte[] {1});
             Span span = mock(Span.class);
             when(span.storeInContext(any(Context.class))).thenCallRealMethod();
             ctx.setTraceContext(Context.root().with(span));
@@ -93,7 +92,7 @@ class RouteServiceTraceTest {
         ConfigService configs = mock(ConfigService.class);
         when(configs.loadBalanceConfig()).thenReturn(SchedulingTestConfig.batchConfig());
         DefaultRouter router = mock(DefaultRouter.class);
-        RequestScheduler scheduler = mock(RequestScheduler.class);
+        PriorityScheduler scheduler = mock(PriorityScheduler.class);
         RouteService service = new RouteService(configs, router, scheduler,
                 mock(RecentCacheKeyTraceReporter.class));
         BalanceContext ctx = new BalanceContext();

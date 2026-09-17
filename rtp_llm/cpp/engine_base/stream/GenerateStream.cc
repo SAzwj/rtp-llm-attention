@@ -877,16 +877,9 @@ StreamState GenerateStream::moveToNext() {
     StreamState                 state      = generate_status_->moveToNext();
     const auto                  new_status = getStatus();
 
-    if ((old_status == StreamState::WAITING && new_status != StreamState::WAITING)
-        || (old_status != StreamState::RUNNING && new_status == StreamState::RUNNING && !running_started_)) {
-        const auto transition_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-        if (old_status == StreamState::WAITING && new_status != StreamState::WAITING) {
-            wait_time_us_ = transition_time_us - begin_time_us_;
-        }
-        if (old_status != StreamState::RUNNING && new_status == StreamState::RUNNING && !running_started_) {
-            running_started_         = true;
-            running_started_time_us_ = transition_time_us;
-        }
+    if (old_status != StreamState::RUNNING && new_status == StreamState::RUNNING && !running_started_) {
+        running_started_         = true;
+        running_started_time_us_ = autil::TimeUtility::currentTimeInMicroSeconds();
     }
 
     // notify one thread waiting for stream completion

@@ -1,5 +1,8 @@
 package org.flexlb.balance.scheduler;
 
+import com.google.protobuf.DescriptorProtos;
+import com.google.protobuf.Descriptors;
+import com.google.protobuf.DynamicMessage;
 import org.flexlb.balance.endpoint.PrefillEndpoint;
 import org.flexlb.config.ConfigService;
 import org.flexlb.config.FlexlbConfig;
@@ -82,16 +85,16 @@ class DefaultBatchDispatcherTest {
     private void assertDispatchedTraceContexts(boolean enabled, boolean validScheduleContext) throws Exception {
         org.flexlb.telemetry.FlexlbTrace.configure(enabled ? io.opentelemetry.api.OpenTelemetry.noop() : null, "");
         PrefillEndpoint prefillEp = createPrefillEndpoint();
-        ScheduledRequest first = createScheduledRequest(501L, 500, 200, prefillEp);
-        ScheduledRequest second = createScheduledRequest(502L, 500, 200, prefillEp);
-        first.ctx().setGenerateInputPb(generateInputWithTraceContext(
+        BatchItem first = createBatchItem(501L, 500, 200, prefillEp);
+        BatchItem second = createBatchItem(502L, 500, 200, prefillEp);
+        first.ctx().setGenerateInputPbBytes(generateInputWithTraceContext(
                 501L,
                 "00-11111111111111111111111111111111-1111111111111111-01",
-                "vendor=one").toByteString());
-        second.ctx().setGenerateInputPb(generateInputWithTraceContext(
+                "vendor=one").toByteArray());
+        second.ctx().setGenerateInputPbBytes(generateInputWithTraceContext(
                 502L,
                 "00-22222222222222222222222222222222-2222222222222222-01",
-                "vendor=two").toByteString());
+                "vendor=two").toByteArray());
         if (validScheduleContext) {
             first.ctx().setTraceContext(scheduleContext(
                     "11111111111111111111111111111111", "aaaaaaaaaaaaaaaa", "schedule"));
@@ -109,7 +112,7 @@ class DefaultBatchDispatcherTest {
                     return CompletableFuture.completedFuture(ackResponse(92L, List.of(501L, 502L)));
                 });
 
-        submit(List.of(first, second), 92L, 100, "trace_context", callback);
+        dispatcher.dispatch(List.of(first, second), prefillEp, 92L, 100, "trace_context", callback);
 
         assertTrue(callback.successLatch.await(5, TimeUnit.SECONDS));
         assertEquals(1, sent.size());
@@ -134,7 +137,7 @@ class DefaultBatchDispatcherTest {
                         + (replaced ? "bbbbbbbbbbbbbbbb" : "2222222222222222") + "-01",
                 secondSent.getRequestInfo().getTraceContext().getTraceparent());
         assertEquals(replaced ? "" : "vendor=two", secondSent.getRequestInfo().getTraceContext().getTracestate());
-        assertEquals("vendor=one", EngineRpcService.GenerateInputPB.parseFrom(first.ctx().getGenerateInputPb())
+        assertEquals("vendor=one", EngineRpcService.GenerateInputPB.parseFrom(first.ctx().getGenerateInputPbBytes())
                 .getRequestInfo().getTraceContext().getTracestate(), "dispatch must not mutate the queued payload");
     }
 
@@ -264,8 +267,8 @@ class DefaultBatchDispatcherTest {
     @Test
     void batchAttributesAndValidatedResponseTimePrecedeEveryItemCallback() throws Exception {
         PrefillEndpoint endpoint = createPrefillEndpoint();
-        ScheduledRequest first = createScheduledRequest(601L, 20, 0, endpoint);
-        ScheduledRequest second = createScheduledRequest(602L, 20, 0, endpoint);
+        BatchItem first = createBatchItem(601L, 20, 0, endpoint);
+        BatchItem second = createBatchItem(602L, 20, 0, endpoint);
         var firstSpan = mock(io.opentelemetry.api.trace.Span.class);
         var secondSpan = mock(io.opentelemetry.api.trace.Span.class);
         when(firstSpan.storeInContext(any(io.opentelemetry.context.Context.class))).thenCallRealMethod();
@@ -276,19 +279,27 @@ class DefaultBatchDispatcherTest {
                 .thenReturn(CompletableFuture.completedFuture(ackResponse(93L, List.of(601L, 602L))));
         CompletableFuture<Void> verified = new CompletableFuture<>();
         AtomicInteger remaining = new AtomicInteger(2);
-        submit(List.of(first, second), 93L, 100, "trace_timing", (item, result) -> {
-            try {
-                var span = item == first ? firstSpan : secondSpan;
-                verify(span).setAttribute(org.flexlb.telemetry.FlexlbTrace.BATCH_ID, 93L);
-                verify(span).setAttribute(org.flexlb.telemetry.FlexlbTrace.BATCH_SIZE, 2L);
-                verify(span).setAttribute(org.flexlb.telemetry.FlexlbTrace.DISPATCH_REASON, "trace_timing");
-                verify(span).setAttribute(org.mockito.ArgumentMatchers.eq(
-                        org.flexlb.telemetry.FlexlbTrace.ENQUEUE_BATCH_MS), anyLong());
-                assertEquals(DeliveryResult.Status.DELIVERED, result.status());
-                if (remaining.decrementAndGet() == 0) {
-                    verified.complete(null);
+        dispatcher.dispatch(List.of(first, second), endpoint, 93L, 100, "trace_timing", new DispatchCallback() {
+            @Override
+            public void onSuccess(BatchItem item, long batchId) {
+                try {
+                    var span = item == first ? firstSpan : secondSpan;
+                    verify(span).setAttribute(org.flexlb.telemetry.FlexlbTrace.BATCH_ID, 93L);
+                    verify(span).setAttribute(org.flexlb.telemetry.FlexlbTrace.BATCH_SIZE, 2L);
+                    verify(span).setAttribute(org.flexlb.telemetry.FlexlbTrace.DISPATCH_REASON, "trace_timing");
+                    verify(span).setAttribute(org.mockito.ArgumentMatchers.eq(
+                            org.flexlb.telemetry.FlexlbTrace.ENQUEUE_BATCH_MS), anyLong());
+                    assertEquals(93L, batchId);
+                    if (remaining.decrementAndGet() == 0) {
+                        verified.complete(null);
+                    }
+                } catch (Throwable error) {
+                    verified.completeExceptionally(error);
                 }
-            } catch (Throwable error) {
+            }
+
+            @Override
+            public void onFailure(BatchItem item, Throwable error) {
                 verified.completeExceptionally(error);
             }
         });
@@ -297,13 +308,14 @@ class DefaultBatchDispatcherTest {
 
     @Test
     void malformedAckDoesNotPublishValidatedResponseTime() throws Exception {
-        ScheduledRequest item = createScheduledRequest(603L, 20, 0, createPrefillEndpoint());
+        PrefillEndpoint endpoint = createPrefillEndpoint();
+        BatchItem item = createBatchItem(603L, 20, 0, endpoint);
         var span = mock(io.opentelemetry.api.trace.Span.class);
         when(span.storeInContext(any(io.opentelemetry.context.Context.class))).thenCallRealMethod();
         item.ctx().setTraceContext(io.opentelemetry.context.Context.root().with(span));
         when(grpcClient.batchEnqueueAsync(anyString(), anyInt(), any(), anyLong()))
                 .thenReturn(CompletableFuture.completedFuture(ackResponse(94L, List.of(999L))));
-        submit(List.of(item), 94L, 100, "malformed", callback);
+        dispatcher.dispatch(List.of(item), endpoint, 94L, 100, "malformed", callback);
         assertTrue(callback.uncertainLatch.await(5, TimeUnit.SECONDS));
         verify(span, never()).setAttribute(org.mockito.ArgumentMatchers.eq(
                 org.flexlb.telemetry.FlexlbTrace.ENQUEUE_BATCH_MS), anyLong());

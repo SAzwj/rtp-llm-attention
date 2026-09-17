@@ -2030,7 +2030,6 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
             streaming=True,
             speculative_steps=self._speculative_steps,
         )
-        emit_query_log(record, rank_id=self._rank_id, server_id=self._server_id)
         trace_state = None
         current_rtp_llm_request_id: Optional[int] = None
         current_external_request_id = ""
@@ -2064,7 +2063,6 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         exc: Optional[BaseException] = None
         try:
             emit_query_log(record, rank_id=self._rank_id, server_id=self._server_id)
-            report_arrival(rank_id=self._rank_id, server_id=self._server_id)
             partial_metadata_sent = False
             first_request = True
             async for request in request_iterator:

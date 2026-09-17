@@ -110,8 +110,9 @@ class TraceTelemetryLifecycleTest(TestCase):
             dash_sc_grpc_server_port=18096,
             ip="127.0.0.1",
             frontend_server_id="42",
+            monitor_interval=1,
         )
-        app.py_env_configs = MagicMock()
+        app.py_env_configs = bg_app.PyEnvConfigs()
         app.py_env_configs.generate_env_config.think_terminate_token_id = -1
         app.py_env_configs.profiling_debug_logging_config.log_file_backup_count = 1
         app._grpc_server = MagicMock()
@@ -119,6 +120,8 @@ class TraceTelemetryLifecycleTest(TestCase):
         app._shutdown_event = MagicMock()
         app._install_signal_handlers = MagicMock()
         app._start_enqueue_loop = MagicMock(return_value=MagicMock())
+        app._enqueue_loop = MagicMock()
+        app._enqueue_loop_thread = None
         app.stop = MagicMock()
 
         with patch.object(

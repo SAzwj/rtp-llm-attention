@@ -1,6 +1,5 @@
 package org.flexlb.dao;
 
-import com.google.protobuf.ByteString;
 import io.opentelemetry.context.Context;
 import lombok.Data;
 import lombok.ToString;

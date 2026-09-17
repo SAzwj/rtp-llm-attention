@@ -290,7 +290,9 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
         GRPC_RET_IF_ERROR(
             decode_context, !decode_context.isRequestCancelled(), grpc::StatusCode::CANCELLED, "request is cancelled");
         GRPC_RET_IF_ERROR(decode_context,
-                          !decode_context.requestDeadlineExceeded(),
+                          decode_context.request_timeout_ms <= 0
+                              || (currentTimeUs() - decode_context.request_begin_time_us) / 1000
+                                     < decode_context.request_timeout_ms,
                           grpc::StatusCode::DEADLINE_EXCEEDED,
                           "request deadline exhausted");
         if (!generate_stream->finishWithoutGenerate()) {

@@ -20,8 +20,6 @@ import org.flexlb.schedule.grpc.FlexlbScheduleProtocol;
 import org.flexlb.interceptor.GrpcQosHeaderInterceptor;
 import org.flexlb.interceptor.GrpcServerTimingInterceptor;
 import org.flexlb.interceptor.GrpcTraceInterceptor;
-import org.flexlb.schedule.grpc.FlexlbScheduleProtocol;
-import org.flexlb.schedule.grpc.FlexlbServiceGrpc;
 import org.flexlb.service.RouteService;
 import org.flexlb.service.grace.ActiveRequestCounter;
 import org.flexlb.service.monitor.BatchSchedulerReporter;
@@ -816,7 +814,9 @@ public class FlexlbServiceImpl extends FlexlbServiceGrpc.FlexlbServiceImplBase {
                 };
                 FlexlbTrace.markBusinessError(traceContext, response.getCode(), errorType);
             }
-            if (ctx != null && ownsLocalRoute(origin)) {
+            if (ctx != null && (origin == ScheduleOrigin.LOCAL_MASTER
+                    || origin == ScheduleOrigin.LOCAL_FALLBACK
+                    || origin == ScheduleOrigin.LOCAL_STANDALONE)) {
                 FlexlbTrace.setScheduleDuration(traceContext, FlexlbTrace.ROUTE_SUBMIT_MS,
                         ctx.getServiceStartNanos(), ctx.getRouteSubmittedNanos());
                 FlexlbTrace.setScheduleDuration(traceContext, FlexlbTrace.BATCH_WAIT_MS,

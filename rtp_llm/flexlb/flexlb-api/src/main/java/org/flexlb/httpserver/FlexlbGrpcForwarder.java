@@ -20,8 +20,6 @@ import org.flexlb.consistency.LBStatusConsistencyService;
 import org.flexlb.interceptor.GrpcTraceInterceptor;
 import org.flexlb.schedule.grpc.FlexlbScheduleProtocol;
 import org.flexlb.schedule.grpc.FlexlbServiceGrpc;
-import org.flexlb.schedule.grpc.FlexlbScheduleProtocol;
-import org.flexlb.config.ConfigService;
 import org.flexlb.service.monitor.EngineHealthReporter;
 import org.flexlb.telemetry.FlexlbTrace;
 import org.flexlb.util.Logger;

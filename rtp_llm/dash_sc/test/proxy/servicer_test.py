@@ -1152,7 +1152,7 @@ class ProxyTracingTest(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "rtp_llm.dash_sc.proxy.servicer.report_arrival",
+            "rtp_llm.dash_sc.proxy.servicer.emit_query_log",
             side_effect=RuntimeError("kmonitor down"),
         ):
             with self.assertRaises(RuntimeError):

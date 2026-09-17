@@ -6,7 +6,6 @@ import org.flexlb.balance.scheduler.PriorityScheduler;
 import org.flexlb.balance.scheduler.RequestLifecycleSnapshot;
 import org.flexlb.balance.scheduler.Router;
 import org.flexlb.config.ConfigService;
-import org.flexlb.config.DispatcherConfig;
 import org.flexlb.config.FlexlbConfig;
 import org.flexlb.dao.BalanceContext;
 import org.flexlb.dao.loadbalance.Response;
@@ -45,8 +44,7 @@ public class RouteService {
         balanceContext.setConfig(flexlbConfig);
         FlexlbTrace.setScheduleAttribute(balanceContext.getTraceContext(),
                 FlexlbTrace.SCHEDULE_MODE, flexlbConfig.isDirect() ? "DIRECT"
-                        : flexlbConfig.getDispatcher().getType() == DispatcherConfig.Type.BATCH
-                                ? "BATCH" : "QUEUE");
+                        : flexlbConfig.isBatchDispatch() ? "BATCH" : "QUEUE");
 
         CompletableFuture<Response> resultFuture;
         if (flexlbConfig.isDirect()) {

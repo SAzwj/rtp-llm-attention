@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include <memory>
 #include <optional>
+#include "rtp_llm/cpp/config/StaticConfig.h"
 
 #define private public
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
@@ -27,11 +28,10 @@ TEST(PrefillRpcServerTest, ThinkModeBudgetUsesPdSeparationWhenMaxNewTokensIsOne)
     generate_config.add_end_think_token_ids(8);
     generate_config.add_end_think_token_ids(9);
 
-    EXPECT_EQ(PrefillRpcServer::effectiveOutputTokenBudget(generate_config), 131075);
     EXPECT_TRUE(PrefillRpcServer::shouldUsePdSeparation(generate_config));
 }
 
-TEST(PrefillRpcServerTest, SingleTokenRequestWithoutPositiveThinkBudgetBypassesPdSeparation) {
+TEST(PrefillRpcServerTest, SingleTokenRequestPreservesGlmPdRoutingAndExplicitOptOut) {
     GenerateConfigPB generate_config;
     generate_config.set_max_new_tokens(1);
     generate_config.set_num_beams(1);
@@ -40,7 +40,8 @@ TEST(PrefillRpcServerTest, SingleTokenRequestWithoutPositiveThinkBudgetBypassesP
     generate_config.set_in_think_mode(true);
     generate_config.set_max_thinking_tokens(-1);
 
-    EXPECT_EQ(PrefillRpcServer::effectiveOutputTokenBudget(generate_config), 1);
+    EXPECT_TRUE(PrefillRpcServer::shouldUsePdSeparation(generate_config));
+    generate_config.set_can_use_pd_separation(false);
     EXPECT_FALSE(PrefillRpcServer::shouldUsePdSeparation(generate_config));
 }
 
@@ -145,7 +146,10 @@ TEST_F(QueryConverterTest, RoleAddrPreservesPdfusionDefaultAndRejectsConflicts) 
     auto*            conflicting = conflict.add_role_addrs();
     conflicting->set_role(RoleAddrPB::PREFILL);
     conflicting->set_role_str("DECODE");
+    const bool core_dump_on_exception            = StaticConfig::user_ft_core_dump_on_exception;
+    StaticConfig::user_ft_core_dump_on_exception = false;
     EXPECT_THROW(QueryConverter::getRoleAddrs(&conflict), std::runtime_error);
+    StaticConfig::user_ft_core_dump_on_exception = core_dump_on_exception;
 
     GenerateConfigPB omitted_legacy_default;
     omitted_legacy_default.add_role_addrs();

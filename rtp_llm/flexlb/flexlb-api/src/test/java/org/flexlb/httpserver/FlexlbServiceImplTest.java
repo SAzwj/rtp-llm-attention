@@ -3,6 +3,7 @@ package org.flexlb.httpserver;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.grpc.Status;
+import io.grpc.Context;
 import io.grpc.stub.StreamObserver;
 import org.flexlb.balance.scheduler.DeliveryClaimKind;
 import org.flexlb.balance.scheduler.RequestLifecycleSnapshot;

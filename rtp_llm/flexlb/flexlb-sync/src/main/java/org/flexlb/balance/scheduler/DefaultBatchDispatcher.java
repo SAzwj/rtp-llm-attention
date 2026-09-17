@@ -317,8 +317,10 @@ public class DefaultBatchDispatcher implements BatchDispatcher {
         // Schedule response and end the request's SERVER span.
         long responseNanos = System.nanoTime();
         for (BatchItem item : items) {
-            FlexlbTrace.setScheduleDuration(item.ctx().getTraceContext(), FlexlbTrace.ENQUEUE_BATCH_MS,
-                    item.ctx().getBatchDispatchedNanos(), responseNanos);
+            if (successIds.contains(item.requestId()) || errorByRequestId.containsKey(item.requestId())) {
+                FlexlbTrace.setScheduleDuration(item.ctx().getTraceContext(), FlexlbTrace.ENQUEUE_BATCH_MS,
+                        item.ctx().getBatchDispatchedNanos(), responseNanos);
+            }
             try {
                 if (successIds.contains(item.requestId())) {
                     callback.onSuccess(item, batchId);

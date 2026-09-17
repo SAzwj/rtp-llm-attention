@@ -783,7 +783,7 @@ TEST_F(GenerateStreamTest, timeInfoSeparatesLegacyWaitFromRunningMilestone) {
     waiting_error->reportError(ErrorCode::CANCELLED, "cancelled while waiting");
     EXPECT_EQ(waiting_error->moveToNext(), StreamState::FINISHED);
     auto waiting_info = waiting_error->getTimeInfo();
-    EXPECT_GT(waiting_info.wait_time_us, 0);
+    EXPECT_EQ(waiting_info.wait_time_us, 0);
     EXPECT_FALSE(waiting_info.running_started);
     EXPECT_EQ(waiting_info.running_started_time_us, 0);
 
@@ -799,20 +799,22 @@ TEST_F(GenerateStreamTest, timeInfoSeparatesLegacyWaitFromRunningMilestone) {
     EXPECT_EQ(loading_info.wait_time_us, 1234);
     EXPECT_FALSE(loading_info.running_started);
 
-    auto running = builder.createComplexContextStream({1, 2, 3});
+    auto running                 = builder.createComplexContextStream({1, 2, 3});
+    running->wait_time_us_       = 1234;
+    running->wait_time_recorded_ = true;
     running->reportEvent(StreamEvents::CanRun);
     EXPECT_EQ(running->moveToNext(), StreamState::RUNNING);
     auto running_info = running->getTimeInfo();
     EXPECT_TRUE(running_info.running_started);
+    EXPECT_EQ(running_info.wait_time_us, 1234);
     EXPECT_GE(running_info.running_started_time_us, running_info.begin_time_us);
-    const auto legacy_wait_time_us = running_info.wait_time_us;
 
     const auto reset_begin_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
     running->resetBeginTime(reset_begin_time_us);
     auto reset_info = running->getTimeInfo();
     EXPECT_EQ(reset_info.begin_time_us, reset_begin_time_us);
     EXPECT_EQ(reset_info.running_started_time_us, reset_begin_time_us);
-    EXPECT_EQ(reset_info.wait_time_us, legacy_wait_time_us);
+    EXPECT_EQ(reset_info.wait_time_us, 0);
 }
 
 TEST_F(GenerateStreamTest, timeInfoPublishesFirstTokenAndGenerateDoneOnlyAfterCommit) {
@@ -841,6 +843,35 @@ TEST_F(GenerateStreamTest, timeInfoPublishesFirstTokenAndGenerateDoneOnlyAfterCo
     EXPECT_GE(info.first_token_time_us, info.running_started_time_us);
     EXPECT_GE(info.generation_done_time_us, info.first_token_time_us);
     EXPECT_EQ(valid->getStatus(), StreamState::RUNNING);
+}
+
+TEST_F(GenerateStreamTest, prefillCompletionFinishesWithoutPublishingGeneration) {
+    auto       builder         = GenerateStreamBuilder();
+    auto       stream          = builder.createComplexContextStream({1, 2, 3});
+    const auto original_length = stream->seqLength();
+    ASSERT_EQ(stream->getStatus(), StreamState::WAITING);
+    EXPECT_TRUE(stream->finishWithoutGenerate());
+    EXPECT_TRUE(stream->isFinished());
+    EXPECT_EQ(stream->seqLength(), original_length);
+    const auto info = stream->getTimeInfo();
+    EXPECT_FALSE(info.running_started);
+    EXPECT_FALSE(info.first_token_committed);
+    EXPECT_FALSE(info.generation_done);
+    EXPECT_FALSE(stream->finishWithoutGenerate());
+}
+
+TEST_F(GenerateStreamTest, prefillCompletionDoesNotOverrideRunningOrCancelledStreams) {
+    auto builder = GenerateStreamBuilder();
+    auto running = builder.createComplexContextStream({1, 2, 3});
+    running->reportEvent(StreamEvents::CanRun);
+    ASSERT_EQ(running->moveToNext(), StreamState::RUNNING);
+    EXPECT_FALSE(running->finishWithoutGenerate());
+    EXPECT_EQ(running->getStatus(), StreamState::RUNNING);
+
+    auto cancelled = builder.createComplexContextStream({1, 2, 3});
+    cancelled->reportError(ErrorCode::CANCELLED, "cancelled before prefill completion");
+    EXPECT_FALSE(cancelled->finishWithoutGenerate());
+    EXPECT_TRUE(cancelled->statusInfo().hasError());
 }
 
 TEST_F(GenerateStreamTest, timeInfoSnapshotIsCoherentDuringLifecyclePublication) {

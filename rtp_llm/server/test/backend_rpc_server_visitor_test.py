@@ -3,7 +3,7 @@ import os
 import unittest
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import torch
 
@@ -21,7 +21,110 @@ from rtp_llm.server.backend_rpc_server_visitor import (
 )
 from rtp_llm.server.cache_key_routing import route_cache_keys_for_page_rr
 from rtp_llm.server.master_client import FlexlbResponse, MasterClient
+from rtp_llm.telemetry import attributes as trace_attrs
 from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput, GenerateOutputs
+
+
+class TestBackendRouteTrace(unittest.TestCase):
+    def test_domain_fallback_preserves_original_source(self):
+        for source in ("request", "master"):
+            with self.subTest(source=source):
+                visitor = BackendRPCServerVisitor.__new__(BackendRPCServerVisitor)
+                visitor.master_config = None
+                visitor.host_service = Mock()
+                visitor.host_service.get_master_addr.return_value = "master:9000"
+                visitor.backend_role_list = ["PREFILL", "DECODE"]
+                request = _FakeInput()
+                prefill = RoleAddr(
+                    role=RoleType.PREFILL, ip="prefill", http_port=1, grpc_port=2
+                )
+                decode = RoleAddr(
+                    role=RoleType.DECODE, ip="decode", http_port=3, grpc_port=4
+                )
+
+                async def master_route(route_input):
+                    route_input.generate_config.role_addrs.append(prefill)
+
+                async def domain_route(route_input):
+                    route_input.generate_config.role_addrs.append(decode)
+
+                if source == "request":
+                    request.generate_config.role_addrs.append(prefill)
+                visitor.get_master_route_addrs = master_route
+                visitor.get_domain_route_addrs = domain_route
+                span = Mock()
+                with patch(
+                    "rtp_llm.server.backend_rpc_server_visitor.start_internal_span",
+                    return_value=span,
+                ), patch("rtp_llm.server.backend_rpc_server_visitor.kmonitor.report"):
+                    asyncio.run(visitor.route_ips(request))
+                span.set_attribute.assert_any_call(
+                    trace_attrs.RTP_LLM_ROUTE_SOURCE, source + "+domain_fallback"
+                )
+                span.finish.assert_called_once_with()
+
+    def test_proactive_rejection_finishes_after_all_attributes(self):
+        visitor = BackendRPCServerVisitor.__new__(BackendRPCServerVisitor)
+        visitor.master_config = SimpleNamespace(master_queue_reject_threshold=-1)
+        visitor.host_service = MagicMock()
+        visitor.host_service.get_queue_length.return_value = 0
+        route_span = MagicMock()
+        request = SimpleNamespace(request_id=123)
+
+        with patch(
+            "rtp_llm.server.backend_rpc_server_visitor.start_internal_span",
+            return_value=route_span,
+        ), patch("rtp_llm.server.backend_rpc_server_visitor.kmonitor.report"):
+            with self.assertRaisesRegex(
+                Exception, "queue length 0 exceeds threshold -1"
+            ):
+                asyncio.run(visitor.route_ips(request))
+
+        route_span.set_attribute.assert_any_call(trace_attrs.REQUEST_ID, "123")
+        route_span.set_attribute.assert_any_call(
+            trace_attrs.RTP_LLM_ROUTE_QUEUE_LENGTH, 0
+        )
+        route_span.set_attribute.assert_any_call(
+            trace_attrs.RTP_LLM_ROUTE_QUEUE_REJECT_THRESHOLD, -1
+        )
+        route_span.set_attribute.assert_any_call(
+            trace_attrs.RTP_LLM_ROUTE_SOURCE, "none"
+        )
+        route_span.set_attribute.assert_any_call(
+            trace_attrs.RTP_LLM_ERROR_CODE, int(ExceptionType.TRAFFIC_LIMIT_ERROR)
+        )
+        route_span.finish.assert_called_once()
+        self.assertEqual(
+            route_span.finish.call_args.kwargs["error_type"], "TrafficLimit"
+        )
+        self.assertEqual(route_span.method_calls[-1][0], "finish")
+        self.assertIn("none", trace_attrs.RTP_LLM_ROUTE_SOURCE_VALUES)
+
+    def test_route_cancellation_uses_stable_span_error_type(self):
+        visitor = BackendRPCServerVisitor.__new__(BackendRPCServerVisitor)
+        visitor.master_config = None
+        visitor.host_service = MagicMock()
+        visitor.host_service.get_master_addr.return_value = "master:9000"
+        visitor.backend_role_list = ["PREFILL"]
+        route_span = MagicMock()
+
+        async def cancel_master_route(_input):
+            raise asyncio.CancelledError("request cancelled")
+
+        visitor.get_master_route_addrs = cancel_master_route
+
+        with patch(
+            "rtp_llm.server.backend_rpc_server_visitor.start_internal_span",
+            return_value=route_span,
+        ), patch("rtp_llm.server.backend_rpc_server_visitor.kmonitor.report"):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(visitor.route_ips(_FakeInput()))
+
+        route_span.set_attribute.assert_any_call(
+            trace_attrs.RTP_LLM_ROUTE_SOURCE, "none"
+        )
+        route_span.finish.assert_called_once()
+        self.assertEqual(route_span.finish.call_args.kwargs["error_type"], "Cancelled")
 
 
 class _FakeTokenIds:

@@ -234,7 +234,6 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
             "bidi_stream",
             raw_mode=True,
         )
-        emit_query_log(record, rank_id=self._rank_id, server_id=self._server_id)
         server_state = None
 
         def _ensure_server_span(body_headers: Optional[dict[str, str]] = None):
@@ -258,7 +257,6 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         exc: Optional[BaseException] = None
         try:
             emit_query_log(record, rank_id=self._rank_id, server_id=self._server_id)
-            report_arrival(rank_id=self._rank_id, server_id=self._server_id)
             request_iter = request_iterator.__aiter__()
             try:
                 first_request = await request_iter.__anext__()

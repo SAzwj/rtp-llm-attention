@@ -1415,7 +1415,7 @@ TEST_F(PrefillBatchTraceTest, VitPreservesErrorsAndEndsOnException) {
     server.mm_processor_                = processor;
     auto                         parent = telemetry::startRpcServerSpan("rtp_llm.generate_stream_call", nullptr);
     const std::vector<ErrorCode> errors = {
-        ErrorCode::MM_REMOTE_RPC_FAILED, ErrorCode::GENERATE_TIMEOUT, ErrorCode::CANCELLED};
+        ErrorCode::MM_PROCESS_ERROR, ErrorCode::GENERATE_TIMEOUT, ErrorCode::CANCELLED};
     std::shared_ptr<GenerateInput> input;
     for (const auto code : errors) {
         processor->result_code = code;
@@ -1489,10 +1489,12 @@ TEST_F(PrefillBatchTraceTest, PerRequestCarriersCreateIsolatedLogicalParentsAndP
     ASSERT_TRUE(slots[0].deferred->context->trace_span_guard);
     ASSERT_TRUE(slots[1].deferred->context->trace_span_guard);
 
-    auto& first_context          = *slots[0].deferred->context;
-    first_context.generate_input = makeGenerateInput(4001);
-    first_context.generate_input->generate_config->role_addrs.emplace_back(
-        RoleType::DECODE, "127.0.0.1", /*http_port=*/0, decode_server.port());
+    server.engine_       = std::make_shared<PartialEnqueueEngine>();
+    auto* decode_address = slots[0].input->mutable_generate_config()->add_role_addrs();
+    decode_address->set_role(RoleAddrPB::DECODE);
+    decode_address->set_ip("127.0.0.1");
+    decode_address->set_grpc_port(decode_server.port());
+    auto& first_context = *slots[0].deferred->context;
     server.prepareAllocateResource(first_context);
     ASSERT_TRUE(first_context.error_status.ok()) << first_context.error_status.error_message();
     ASSERT_TRUE(first_context.closeGrpcStream().ok());
@@ -1550,8 +1552,8 @@ TEST_F(PrefillBatchTraceTest, ActiveOnlyShutdownWaitsForOperationOwnerAndEndsOnc
     ASSERT_TRUE(contexts->registerActive(4051, deferred).ok());
     contexts->cancelAll(grpc::Status(grpc::StatusCode::UNAVAILABLE, "shutdown"));
 
-    EXPECT_TRUE(deferred->context->error_status.ok());
-    EXPECT_FALSE(deferred->context->cancel_state->load());
+    EXPECT_EQ(deferred->context->error_status.error_code(), grpc::StatusCode::UNAVAILABLE);
+    EXPECT_TRUE(deferred->context->cancel_state->load());
     EXPECT_TRUE(span_data_->GetSpans().empty());
     EXPECT_FALSE(deferred->finishOperation());
     server.finishSlotOperation(4051, deferred);
