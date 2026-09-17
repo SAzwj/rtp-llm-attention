@@ -104,8 +104,10 @@ public:
     // priority-preemption first cause and its CANCELING overlay.
     void         dequeueStreamFromRuntimeMeta();
     void         nextStage();
-    grpc::Status closeGrpcStream();
+    grpc::Status closeGrpcStream(const std::string& attempt_error_override = "");
     void         closeGrpcConnection();
+
+    std::unique_ptr<telemetry::RequestSpanGuard> pd_client_span_guard;
 
 private:
     void markRequestEnd();
@@ -123,6 +125,8 @@ public:
     RPCContext                           rpc_context;
     std::shared_ptr<GenerateInput>       generate_input;
     std::string                          decode_addr;
+    std::string                          trace_server_address;
+    int64_t                              trace_server_port = 0;
     std::vector<std::string>             prefill_worker_cache_store_addrs;
     GrpcConnection                       grpc_connection;
     std::shared_ptr<RpcService::Stub>    stub;

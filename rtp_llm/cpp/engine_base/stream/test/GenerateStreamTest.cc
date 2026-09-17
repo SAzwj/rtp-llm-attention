@@ -11,6 +11,9 @@
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/models/logits_processor/ThinkModeLogitsProcessor.h"
 
+#include <atomic>
+#include <future>
+
 using namespace std;
 
 namespace rtp_llm {
@@ -54,22 +57,26 @@ public:
         std::shared_ptr<GenerateInput>  generate_input(new GenerateInput());
         std::shared_ptr<GenerateConfig> generate_config(new GenerateConfig());
         generate_config->num_return_sequences = 2;
+        generate_input->begin_time_us         = autil::TimeUtility::currentTimeInMicroSeconds();
         generate_input->input_ids =
             torch::tensor(std::vector<int32_t>(input_ids.begin(), input_ids.end()), torch::kInt32);
         generate_input->generate_config = generate_config;
         ModelConfig   model_config;
         RuntimeConfig runtime_config;
         model_config.max_seq_len = 2048;
+        model_config.vocab_size  = 1024;
         auto stream              = std::make_shared<NormalGenerateStream>(
             generate_input, model_config, runtime_config, resource_context, nullptr);
 
         return stream;
     }
 
-    GenerateStreamPtr createDecoderStream(std::vector<int> input_ids, std::vector<int> new_token_ids) {
+    GenerateStreamPtr
+    createDecoderStream(std::vector<int> input_ids, std::vector<int> new_token_ids, int num_return_sequences = 1) {
         std::shared_ptr<GenerateInput>  generate_input(new GenerateInput());
         std::shared_ptr<GenerateConfig> generate_config(new GenerateConfig());
-        ResourceContext                 resource_context;
+        generate_config->num_return_sequences = num_return_sequences;
+        ResourceContext resource_context;
         generate_input->generate_config = generate_config;
         generate_input->input_ids =
             torch::tensor(std::vector<int32_t>(input_ids.begin(), input_ids.end()), torch::kInt32);
@@ -83,6 +90,24 @@ public:
         stream_ptr->setSeqLength(stream_ptr->seqLength() + new_token_ids.size());
         return stream_ptr;
     };
+
+    std::shared_ptr<NormalGenerateStream> createBeamStream(std::vector<int> input_ids) {
+        auto cache_config  = init_config();
+        auto cache_manager = std::make_shared<KVCacheManager>(cache_config);
+        cache_manager->init();
+        ResourceContext resource_context;
+        resource_context.cache_manager = cache_manager;
+
+        auto generate_input                          = std::make_shared<GenerateInput>();
+        generate_input->generate_config              = std::make_shared<GenerateConfig>();
+        generate_input->generate_config->num_beams   = 2;
+        generate_input->generate_config->reuse_cache = false;
+        generate_input->begin_time_us                = autil::TimeUtility::currentTimeInMicroSeconds();
+        generate_input->input_ids =
+            torch::tensor(std::vector<int32_t>(input_ids.begin(), input_ids.end()), torch::kInt32);
+        return std::make_shared<NormalGenerateStream>(
+            generate_input, model_config_, runtime_config_, resource_context, nullptr);
+    }
 
 private:
     ModelConfig   model_config_;
@@ -129,7 +154,7 @@ TEST_F(GenerateStreamTest, testAsyncReleaseConcurrentHandoff) {
         ASSERT_GT(stream->stream_cache_resource_->curBlocksNum(), 0);
         stream->incPendingAsyncBookkeeping();
         std::atomic<bool> start{false};
-        std::thread worker([&] {
+        std::thread       worker([&] {
             while (!start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
@@ -151,16 +176,16 @@ TEST_F(GenerateStreamTest, testAsyncReleaseConcurrentHandoff) {
 TEST_F(GenerateStreamTest, testMtpMinNewTokensIgnoresEarlyStopWithinAcceptedBatch) {
     for (bool use_eos : {false, true}) {
         for (bool stop_at_minimum : {false, true}) {
-            auto config = std::make_shared<GenerateConfig>();
+            auto config            = std::make_shared<GenerateConfig>();
             config->min_new_tokens = 8;
             config->max_new_tokens = 8;
-            config->aux_info = true;
-            config->is_streaming = false;
-            config->ignore_eos = !use_eos;
+            config->aux_info       = true;
+            config->is_streaming   = false;
+            config->ignore_eos     = !use_eos;
             if (!use_eos) {
                 config->stop_words_list = {{7}};
             }
-            auto stream = GenerateStreamBuilder().createContextStream({1, 2}, config);
+            auto stream                          = GenerateStreamBuilder().createContextStream({1, 2}, config);
             stream->special_tokens_.eos_token_id = 7;
             stream->update({torch::tensor({{3, 4, 5, 6}}, torch::kInt32), 4});
             ASSERT_FALSE(stream->hasOutput());
@@ -176,6 +201,28 @@ TEST_F(GenerateStreamTest, testMtpMinNewTokensIgnoresEarlyStopWithinAcceptedBatc
             EXPECT_EQ(result.aux_info.output_len, 8);
         }
     }
+}
+
+void updateOneToken(const GenerateStreamPtr& stream, int token_id) {
+    const auto new_tokens = torch::full(
+        {static_cast<int64_t>(stream->currentBatchSize()), 1}, token_id, torch::TensorOptions().dtype(torch::kInt32));
+    stream->update({new_tokens,
+                    1,
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    true,
+                    false,
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    -1,
+                    1});
 }
 
 TEST_F(GenerateStreamTest, testConstruct) {
@@ -327,6 +374,125 @@ TEST_F(GenerateStreamTest, testLogprobsHistoryUsesBoundedGeometricGrowth) {
                              torch::arange(65 * 20, torch::kInt32).reshape({1, 65, 20})));
     EXPECT_TRUE(torch::equal(stream->getTopLogProbs().narrow(1, 0, 65),
                              torch::arange(65 * 20, torch::kFloat32).reshape({1, 65, 20})));
+}
+
+TEST_F(GenerateStreamTest, thinkTerminateTokenFinishesBeforeMinNewTokens) {
+    auto builder                                       = GenerateStreamBuilder();
+    auto stream                                        = builder.createDecoderStream({10, 11, 12}, {20, 42, 99});
+    stream->generateConfig()->in_think_mode            = true;
+    stream->generateConfig()->think_terminate_token_id = 42;
+    stream->generateConfig()->min_new_tokens           = 100;
+
+    EXPECT_TRUE(stream->needFinishBySPTokens());
+    EXPECT_EQ(stream->seqLength(), 5);
+    EXPECT_EQ(stream->getLatestTokens(1), std::vector<int>({42}));
+}
+
+TEST_F(GenerateStreamTest, thinkTerminateTokenIsInactiveOutsideThinkMode) {
+    auto builder                                       = GenerateStreamBuilder();
+    auto stream                                        = builder.createDecoderStream({10, 11, 12}, {20, 42});
+    stream->generateConfig()->in_think_mode            = false;
+    stream->generateConfig()->think_terminate_token_id = 42;
+    stream->generateConfig()->min_new_tokens           = 100;
+
+    EXPECT_FALSE(stream->needFinishBySPTokens());
+    EXPECT_EQ(stream->seqLength(), 5);
+}
+
+TEST_F(GenerateStreamTest, thinkTerminateTokenFinishesAllReturnSequences) {
+    auto builder                                       = GenerateStreamBuilder();
+    auto stream                                        = builder.createDecoderStream({10, 11, 12}, {20, 42}, 2);
+    stream->generateConfig()->in_think_mode            = true;
+    stream->generateConfig()->think_terminate_token_id = 42;
+
+    ASSERT_EQ(stream->currentBatchSize(), 2);
+    EXPECT_TRUE(stream->needFinishBySPTokens());
+    EXPECT_TRUE(stream->isSubGenerateDoneWithoutLock(0));
+    EXPECT_TRUE(stream->isSubGenerateDoneWithoutLock(1));
+}
+
+TEST_F(GenerateStreamTest, thinkNaturalCloseBeforeTerminateKeepsStreamRunning) {
+    auto builder                                       = GenerateStreamBuilder();
+    auto stream                                        = builder.createDecoderStream({10, 11, 12}, {20, 43, 99, 42});
+    stream->generateConfig()->in_think_mode            = true;
+    stream->generateConfig()->end_think_token_ids      = {43, 44};
+    stream->generateConfig()->think_terminate_token_id = 42;
+    stream->generateConfig()->min_new_tokens           = 100;
+
+    EXPECT_FALSE(stream->needFinishBySPTokens());
+    EXPECT_EQ(stream->seqLength(), 7);
+    EXPECT_EQ(stream->getLatestTokens(1), std::vector<int>({42}));
+}
+
+TEST_F(GenerateStreamTest, thinkNaturalCloseInPriorStepKeepsLaterTerminateToken) {
+    auto builder                                       = GenerateStreamBuilder();
+    auto stream                                        = builder.createDecoderStream({10, 11, 12}, {20});
+    stream->generateConfig()->in_think_mode            = true;
+    stream->generateConfig()->end_think_token_ids      = {43, 44};
+    stream->generateConfig()->think_terminate_token_id = 42;
+    stream->generateConfig()->min_new_tokens           = 100;
+
+    updateOneToken(stream, 43);
+    EXPECT_FALSE(stream->needFinishBySPTokens());
+    updateOneToken(stream, 42);
+
+    EXPECT_FALSE(stream->needFinishBySPTokens());
+    EXPECT_EQ(stream->seqLength(), 6);
+    EXPECT_EQ(stream->getLatestTokens(1), std::vector<int>({42}));
+}
+
+TEST_F(GenerateStreamTest, thinkTerminateTokenRecomputesAfterBeamReorder) {
+    auto builder                                       = GenerateStreamBuilder();
+    auto stream                                        = builder.createBeamStream({10, 11, 12});
+    stream->generateConfig()->in_think_mode            = true;
+    stream->generateConfig()->end_think_token_ids      = {43, 44};
+    stream->generateConfig()->think_terminate_token_id = 42;
+    stream->generateConfig()->min_new_tokens           = 100;
+    ASSERT_TRUE(stream->initKVBlock().ok());
+
+    const auto empty = torch::Tensor();
+    stream->update({torch::tensor({{10, 11, 12, 20}, {10, 11, 12, 43}}, torch::kInt32),
+                    1,
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    torch::tensor({0, 0}, torch::kInt32),
+                    empty});
+    EXPECT_FALSE(stream->isFinished());
+
+    // Reorder the naturally closed beam into output 0. Its later terminate
+    // token is answer content and must not finish the stream.
+    stream->update({torch::tensor({{10, 11, 12, 43, 42}, {10, 11, 12, 20, 21}}, torch::kInt32),
+                    1,
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    torch::tensor({1, 0}, torch::kInt32),
+                    empty});
+    EXPECT_FALSE(stream->isFinished());
+    EXPECT_EQ(stream->seqLength(), 5);
+
+    // Reorder the still-thinking beam into output 0. It has no natural close,
+    // so its terminate token must still finish the physical call.
+    stream->update({torch::tensor({{10, 11, 12, 20, 21, 42}, {10, 11, 12, 43, 42, 99}}, torch::kInt32),
+                    1,
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    torch::tensor({1, 0}, torch::kInt32),
+                    empty});
+    EXPECT_TRUE(stream->needFinishBySPTokens());
+    EXPECT_EQ(stream->seqLength(), 6);
+    EXPECT_EQ(stream->getLatestTokens(1), std::vector<int>({42}));
 }
 
 TEST_F(GenerateStreamTest, testGenerateStreamReuseCacheMethod) {
@@ -607,6 +773,123 @@ TEST_F(GenerateStreamTest, testMtpAsyncDeviceStateBackCompatWrappers) {
     ASSERT_FALSE(stream->getAcceptTokensGpu().defined());
     ASSERT_FALSE(stream->getNextSeqLenGpu().defined());
     ASSERT_FALSE(stream->getProposeTokensGpu().defined());
+}
+
+TEST_F(GenerateStreamTest, timeInfoSeparatesLegacyWaitFromRunningMilestone) {
+    auto builder = GenerateStreamBuilder();
+
+    auto waiting_error = builder.createComplexContextStream({1, 2, 3});
+    waiting_error->resetBeginTime(autil::TimeUtility::currentTimeInMicroSeconds() - 2000);
+    waiting_error->reportError(ErrorCode::CANCELLED, "cancelled while waiting");
+    EXPECT_EQ(waiting_error->moveToNext(), StreamState::FINISHED);
+    auto waiting_info = waiting_error->getTimeInfo();
+    EXPECT_GT(waiting_info.wait_time_us, 0);
+    EXPECT_FALSE(waiting_info.running_started);
+    EXPECT_EQ(waiting_info.running_started_time_us, 0);
+
+    auto loading_error = builder.createComplexContextStream({1, 2, 3});
+    {
+        std::lock_guard<std::mutex> lock(*loading_error->mutex_);
+        loading_error->generate_status_->status.store(StreamState::LOADING_CACHE);
+        loading_error->wait_time_us_ = 1234;
+    }
+    loading_error->reportError(ErrorCode::CANCELLED, "cancelled while loading");
+    EXPECT_EQ(loading_error->moveToNext(), StreamState::FINISHED);
+    auto loading_info = loading_error->getTimeInfo();
+    EXPECT_EQ(loading_info.wait_time_us, 1234);
+    EXPECT_FALSE(loading_info.running_started);
+
+    auto running = builder.createComplexContextStream({1, 2, 3});
+    running->reportEvent(StreamEvents::CanRun);
+    EXPECT_EQ(running->moveToNext(), StreamState::RUNNING);
+    auto running_info = running->getTimeInfo();
+    EXPECT_TRUE(running_info.running_started);
+    EXPECT_GE(running_info.running_started_time_us, running_info.begin_time_us);
+    const auto legacy_wait_time_us = running_info.wait_time_us;
+
+    const auto reset_begin_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+    running->resetBeginTime(reset_begin_time_us);
+    auto reset_info = running->getTimeInfo();
+    EXPECT_EQ(reset_info.begin_time_us, reset_begin_time_us);
+    EXPECT_EQ(reset_info.running_started_time_us, reset_begin_time_us);
+    EXPECT_EQ(reset_info.wait_time_us, legacy_wait_time_us);
+}
+
+TEST_F(GenerateStreamTest, timeInfoPublishesFirstTokenAndGenerateDoneOnlyAfterCommit) {
+    auto builder = GenerateStreamBuilder();
+
+    auto       invalid            = builder.createComplexContextStream({1, 2, 3});
+    const auto invalid_seq_length = invalid->seqLength();
+    updateOneToken(invalid, 1024);
+    auto invalid_info = invalid->getTimeInfo();
+    EXPECT_EQ(invalid->seqLength(), invalid_seq_length);
+    EXPECT_FALSE(invalid_info.first_token_committed);
+    EXPECT_EQ(invalid_info.first_token_time_us, 0);
+    EXPECT_FALSE(invalid_info.generation_done);
+
+    auto valid                             = builder.createComplexContextStream({1, 2, 3});
+    valid->generateConfig()->pd_separation = true;
+    valid->reportEvent(StreamEvents::CanRun);
+    ASSERT_EQ(valid->moveToNext(), StreamState::RUNNING);
+    updateOneToken(valid, 42);
+
+    auto info = valid->getTimeInfo();
+    EXPECT_TRUE(info.running_started);
+    EXPECT_TRUE(info.first_token_committed);
+    EXPECT_TRUE(info.generation_done);
+    EXPECT_EQ(info.first_token_rt_us, info.first_token_time_us - info.begin_time_us);
+    EXPECT_GE(info.first_token_time_us, info.running_started_time_us);
+    EXPECT_GE(info.generation_done_time_us, info.first_token_time_us);
+    EXPECT_EQ(valid->getStatus(), StreamState::RUNNING);
+}
+
+TEST_F(GenerateStreamTest, timeInfoSnapshotIsCoherentDuringLifecyclePublication) {
+    auto builder                            = GenerateStreamBuilder();
+    auto stream                             = builder.createComplexContextStream({1, 2, 3});
+    stream->generateConfig()->pd_separation = true;
+
+    std::atomic<bool>  start{false};
+    std::atomic<bool>  done{false};
+    std::atomic<bool>  inconsistent{false};
+    std::promise<void> first_snapshot;
+    auto               first_snapshot_signal = first_snapshot.get_future();
+    auto               reader                = std::async(std::launch::async, [&] {
+        while (!start.load(std::memory_order_acquire)) {}
+        bool first_snapshot_published = false;
+        while (!done.load(std::memory_order_acquire)) {
+            const auto info = stream->getTimeInfo();
+            if (!first_snapshot_published) {
+                first_snapshot.set_value();
+                first_snapshot_published = true;
+            }
+            if (info.running_started != (info.running_started_time_us > 0)
+                || info.first_token_committed != (info.first_token_time_us > 0)
+                || info.generation_done != (info.generation_done_time_us > 0)
+                || (info.first_token_committed
+                    && info.first_token_rt_us != info.first_token_time_us - info.begin_time_us)
+                || (info.running_started && info.first_token_committed
+                    && info.first_token_time_us < info.running_started_time_us)
+                || (info.first_token_committed && info.generation_done
+                    && info.generation_done_time_us < info.first_token_time_us)) {
+                inconsistent.store(true, std::memory_order_release);
+                return;
+            }
+        }
+    });
+
+    start.store(true, std::memory_order_release);
+    first_snapshot_signal.wait();
+    stream->reportEvent(StreamEvents::CanRun);
+    ASSERT_EQ(stream->moveToNext(), StreamState::RUNNING);
+    updateOneToken(stream, 42);
+    done.store(true, std::memory_order_release);
+    reader.get();
+
+    EXPECT_FALSE(inconsistent.load(std::memory_order_acquire));
+    const auto final_info = stream->getTimeInfo();
+    EXPECT_TRUE(final_info.running_started);
+    EXPECT_TRUE(final_info.first_token_committed);
+    EXPECT_TRUE(final_info.generation_done);
 }
 
 }  // namespace rtp_llm

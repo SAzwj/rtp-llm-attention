@@ -117,6 +117,7 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     complete_token_ids_ = std::make_shared<CompleteTokenIds>(
         init_batch_size, maxBatchSize(), max_seq_len_, model_config.attn_config.tokens_per_block);
     complete_token_ids_->init(input, extra_reserve_token_num);
+    think_token_scan_position_ = inputLength();
 
     last_output_pos_                 = seqLength();
     last_frontend_metric_output_pos_ = last_output_pos_;
@@ -157,6 +158,7 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
 }
 
 void GenerateStream::resetBeginTime(int64_t begin_time_us) {
+    std::lock_guard<std::mutex> lock(*mutex_);
     begin_time_us_               = begin_time_us;
     wait_time_us_                = 0;
     wait_time_recorded_          = false;
@@ -167,6 +169,9 @@ void GenerateStream::resetBeginTime(int64_t begin_time_us) {
     first_running_time_us_       = 0;
     loading_cache_latency_us_    = 0;
     load_done_to_running_us_     = 0;
+    if (running_started_) {
+        running_started_time_us_ = begin_time_us;
+    }
 }
 
 void GenerateStream::recordWaitTime() {
@@ -806,10 +811,7 @@ void GenerateStream::checkTimeout() {
 // 外部线程调用时自动加锁保护 error_info 和 events_ 的一致性。
 void GenerateStream::reportEvent(StreamEvents::EventType event, ErrorCode error_code, const std::string& error_msg) {
     std::lock_guard<std::mutex> lock(*mutex_);
-    if (event == StreamEvents::CanRun) {
-        recordCanRunTime();
-    }
-    generate_status_->reportEvent(event, error_code, error_msg);
+    reportEventWithoutLock(event, error_code, error_msg);
 }
 
 // 无锁版本，供已持有 mutex_ 的内部调用路径使用（如 update/specUpdate/moveToNext 链路）。
@@ -820,11 +822,15 @@ void GenerateStream::reportEventWithoutLock(StreamEvents::EventType event,
         recordCanRunTime();
     }
     generate_status_->reportEvent(event, error_code, error_msg);
+    if (event == StreamEvents::GenerateDone && !generation_done_) {
+        generation_done_         = true;
+        generation_done_time_us_ = autil::TimeUtility::currentTimeInMicroSeconds();
+    }
 }
 
 void GenerateStream::reportError(ErrorCode error_code, const std::string& error_msg) {
     std::lock_guard<std::mutex> lock(*mutex_);
-    generate_status_->reportEvent(StreamEvents::Error, error_code, error_msg);
+    reportEventWithoutLock(StreamEvents::Error, error_code, error_msg);
 }
 
 bool GenerateStream::hasEvent(StreamEvents::EventType event) const {
@@ -852,10 +858,24 @@ void GenerateStream::setReserveStep(size_t reserve_step) {
 StreamState GenerateStream::moveToNext() {
     checkTimeout();
     std::lock_guard<std::mutex> lock(*mutex_);
-    StreamState                 state = generate_status_->moveToNext();
+    const auto                  old_status = getStatus();
+    StreamState                 state      = generate_status_->moveToNext();
+    const auto                  new_status = getStatus();
+
+    if ((old_status == StreamState::WAITING && new_status != StreamState::WAITING)
+        || (old_status != StreamState::RUNNING && new_status == StreamState::RUNNING && !running_started_)) {
+        const auto transition_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        if (old_status == StreamState::WAITING && new_status != StreamState::WAITING) {
+            wait_time_us_ = transition_time_us - begin_time_us_;
+        }
+        if (old_status != StreamState::RUNNING && new_status == StreamState::RUNNING && !running_started_) {
+            running_started_         = true;
+            running_started_time_us_ = transition_time_us;
+        }
+    }
 
     // notify one thread waiting for stream completion
-    if (getStatus() == StreamState::FINISHED) {
+    if (new_status == StreamState::FINISHED) {
         cv_->notify_one();
     }
     return state;
@@ -1021,8 +1041,13 @@ bool GenerateStream::needFinishBySPTokens(int num_new_tokens) {
         // update sub_generate_status to RUNNING for beam search,
         // as the same batch_id may refers to different beams between steps
         fillSubGenerateStatus(StreamState::RUNNING);
+        // Beam updates rewrite and reorder complete rows, so output 0 cannot
+        // inherit the previous step's scan position or natural-close state.
+        think_token_scan_position_ = inputLength();
+        think_naturally_closed_    = false;
     }
 
+    matchThinkTerminateToken();
     if (seqLength() >= generate_input_->generate_config->min_new_tokens + inputLength()) {
         matchEosToken();
         matchStopWordsList();
@@ -1035,6 +1060,36 @@ bool GenerateStream::needFinishBySPTokens(int num_new_tokens) {
     return std::all_of(sub_generate_status_.begin(), sub_generate_status_.end(), [](StreamState state) {
         return state == StreamState::FINISHED;
     });
+}
+
+void GenerateStream::matchThinkTerminateToken() {
+    const auto& config = generate_input_->generate_config;
+    if (!config->in_think_mode || config->think_terminate_token_id <= 0 || think_naturally_closed_) {
+        return;
+    }
+    if (think_token_scan_position_ > seqLength()) {
+        think_token_scan_position_ = inputLength();
+    }
+    const auto* token_ids       = complete_token_ids_->data(0);
+    const bool  has_close_token = !config->end_think_token_ids.empty();
+    const int   close_token_id  = has_close_token ? config->end_think_token_ids.front() : 0;
+    // Dash phase switching is driven by output 0. Once its control token is
+    // observed, the whole physical phase-1 call is complete; waiting for other
+    // choices would force the caller to cancel an otherwise successful RPC.
+    // A natural </think> first keeps the physical stream alive for its answer.
+    for (int position = think_token_scan_position_; position < seqLength(); ++position) {
+        if (token_ids[position] == config->think_terminate_token_id) {
+            complete_token_ids_->setSeqLength(position + 1);
+            think_token_scan_position_ = position + 1;
+            fillSubGenerateStatus(StreamState::FINISHED);
+            return;
+        }
+        if (has_close_token && token_ids[position] == close_token_id) {
+            think_naturally_closed_ = true;
+            return;
+        }
+    }
+    think_token_scan_position_ = seqLength();
 }
 
 void GenerateStream::matchEosToken() {
@@ -1601,8 +1656,8 @@ void GenerateStream::reportStreamMetrics() {
         collector.is_streaming_qps  = generate_input_->generate_config->is_streaming;
         collector.not_streaming_qps = !generate_input_->generate_config->is_streaming;
         if (getStatus() == StreamState::FINISHED || cancelled || timeout) {
-            collector.reuse_length           = initial_reuse_length_;
-            collector.input_token_length     = inputLength();
+            collector.reuse_length       = initial_reuse_length_;
+            collector.input_token_length = inputLength();
             collector.effective_context_length =
                 std::max<int64_t>(0, collector.input_token_length - initial_reuse_length_);
             collector.output_token_length    = outputTokenLen();
@@ -1736,10 +1791,20 @@ void GenerateStream::CopyOnWrite(const GenerateStream& other_stream, bool copy_l
 }
 
 GenerateStream::TimeInfo GenerateStream::getTimeInfo() {
-    return {begin_time_us_,
-            wait_time_us_,
-            complete_token_ids_->firstTokenTimeUs(),
-            complete_token_ids_->firstTokenLatencyUs()};
+    std::lock_guard<std::mutex> lock(*mutex_);
+    const auto                  first_token_time_us = complete_token_ids_->firstTokenTimeUs();
+
+    TimeInfo time_info;
+    time_info.begin_time_us           = begin_time_us_;
+    time_info.wait_time_us            = wait_time_us_;
+    time_info.running_started         = running_started_;
+    time_info.running_started_time_us = running_started_time_us_;
+    time_info.first_token_committed   = first_token_time_us > 0;
+    time_info.first_token_time_us     = first_token_time_us;
+    time_info.first_token_rt_us       = first_token_time_us > 0 ? first_token_time_us - begin_time_us_ : 0;
+    time_info.generation_done         = generation_done_;
+    time_info.generation_done_time_us = generation_done_time_us_;
+    return time_info;
 }
 
 bool GenerateStream::queryPdSep() const {

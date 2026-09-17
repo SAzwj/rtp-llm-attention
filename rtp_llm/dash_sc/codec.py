@@ -2337,6 +2337,7 @@ def build_error_response(
     )
     _append_finished_output(infer, finished=True)
     infer.parameters["incremental_output"].int64_param = 1
+    infer.parameters["error_no"].int64_param = FINISH_REASON_STOP_ENGINE_PARAM
     infer.parameters["status_code"].int64_param = int(status_code)
     infer.parameters["status_name"].string_param = status_name
     infer.parameters["status_message"].string_param = message

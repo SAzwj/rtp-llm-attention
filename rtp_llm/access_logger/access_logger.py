@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from rtp_llm.access_logger.json_util import dump_json
 from rtp_llm.access_logger.log_utils import get_handler
@@ -8,6 +8,29 @@ from rtp_llm.structure.request_constants import request_id_field_name
 
 ACCESS_LOGGER_NAME = "access_logger"
 QUERY_ACCESS_LOGGER_NAME = "query_access_logger"
+
+
+def _current_trace_ids() -> Optional[Tuple[str, str]]:
+    """Return the active request trace and span IDs, if telemetry is enabled."""
+    try:
+        from rtp_llm.telemetry.tracing import CURRENT_TRACE_STATE
+
+        state = CURRENT_TRACE_STATE.get()
+        if state is None or state.server_span is None:
+            return None
+        ctx = state.server_span.get_span_context()
+        if not getattr(ctx, "is_valid", False):
+            return None
+        return format(ctx.trace_id, "032x"), format(ctx.span_id, "016x")
+    except Exception:
+        return None
+
+
+def _attach_trace_ids(access_log: PyAccessLog) -> PyAccessLog:
+    trace_ids = _current_trace_ids()
+    if trace_ids is not None:
+        access_log.trace_id, access_log.span_id = trace_ids
+    return access_log
 
 
 def init_access_logger(
@@ -77,7 +100,7 @@ class AccessLogger:
         access_log = PyAccessLog(
             request=request_log, response=response, id=request[request_id_field_name]
         )
-        self.logger.info(dump_json(access_log))
+        self.logger.info(dump_json(_attach_trace_ids(access_log)))
 
     def log_query_access(self, request: Dict[str, Any]) -> None:
         if not self.is_private_request(request):
@@ -88,7 +111,7 @@ class AccessLogger:
                 response=response_log,
                 id=request[request_id_field_name],
             )
-            self.query_logger.info(dump_json(access_log))
+            self.query_logger.info(dump_json(_attach_trace_ids(access_log)))
 
     def log_success_access(self, request: Dict[str, Any], response: Any) -> None:
         if not self.is_private_request(request):

@@ -42,6 +42,7 @@ from rtp_llm.openai.renderer_factory import ChatRendererFactory
 from rtp_llm.openai.renderers.custom_renderer import RendererParams
 from rtp_llm.ops import SpeculativeType, TaskType
 from rtp_llm.server.backend_rpc_server_visitor import create_backend_rpc_server_visitor
+from rtp_llm.telemetry import init_telemetry, shutdown_telemetry
 
 _PROXY_MODE_ENV_KEY = "DASH_SC_GRPC_PROXY_MODE"
 _FORWARD_ENV_KEY = "DASH_SC_GRPC_FORWARD_ADDR"
@@ -51,6 +52,22 @@ _SERVICER_CLOSE_TIMEOUT_S = 10.0
 _PRE_STOP_DRAIN_SECONDS_ENV = "DASH_SC_GRPC_PRE_STOP_DRAIN_SECONDS"
 _PRE_STOP_DRAIN_HEADROOM_SECONDS_ENV = "RTP_LLM_PRE_STOP_DRAIN_HEADROOM_SECONDS"
 _DEFAULT_PRE_STOP_DRAIN_SECONDS = 120.0
+
+
+def _init_trace_telemetry() -> None:
+    try:
+        # Every DashScApp process is an external server owner. Unlike the
+        # multi-rank engine, it must initialize its own process-level provider.
+        init_telemetry("dash_sc", 0)
+    except Exception as e:
+        logging.warning("[DashScApp] telemetry init failed: %s", e)
+
+
+def _shutdown_trace_telemetry() -> None:
+    try:
+        shutdown_telemetry()
+    except Exception as e:
+        logging.warning("[DashScApp] telemetry shutdown failed: %s", e)
 
 
 def _pre_stop_drain_seconds() -> float:
@@ -470,6 +487,7 @@ class DashScApp:
 
     def start(self, ready_pipe_writer=None) -> None:
         servicer: Any = None
+        _init_trace_telemetry()
         try:
             port = self.server_config.dash_sc_grpc_server_port
             is_proxy = _is_proxy_mode_enabled()
@@ -543,9 +561,7 @@ class DashScApp:
                     and grammar_config.grammar_backend.strip().lower() == "xgrammar"
                 ):
                     grammar_validator = GrammarValidator(
-                        build_model_grammar_tokenizer_info_json(
-                            base_tok, model_config
-                        ),
+                        build_model_grammar_tokenizer_info_json(base_tok, model_config),
                         grammar_config,
                         self.py_env_configs.grammar_admission_config,
                     )
@@ -630,6 +646,7 @@ class DashScApp:
             if servicer is not None:
                 self._close_servicer_on_loop(servicer)
             self._stop_enqueue_loop()
+            _shutdown_trace_telemetry()
             raise
 
         if ready_pipe_writer is not None:
@@ -653,7 +670,10 @@ class DashScApp:
         try:
             self._shutdown_event.wait()
         finally:
-            self.stop()
+            try:
+                self.stop()
+            finally:
+                _shutdown_trace_telemetry()
 
     def stop(self) -> None:
         self._shutdown_manager.start_unavailable("grpc stop")

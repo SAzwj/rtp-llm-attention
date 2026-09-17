@@ -336,14 +336,14 @@ class PyFlashinferPrefillAttnOp(object):
             backend=backend,
         )
         self.datatype = attn_configs.dtype
-        self.params = None
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
 
     def __del__(self):
         release_py_flashinfer_workspace_buffer(self.g_workspace_buffer)
 
     def set_params(self, params: ParamsBase):
         """Set the params object to be used by this op."""
-        self.params = params
+        self.fmha_params = params
 
     def prepare(self, attn_inputs: PyAttentionInputs) -> ParamsBase:
         """
@@ -374,7 +374,7 @@ class PyFlashinferPrefillAttnOp(object):
             causal=True,
             q_data_type=get_scalar_type(attn_inputs.dtype),
         )
-        return self.params if self.params is not None else ParamsBase()
+        return self.fmha_params
 
     @staticmethod
     def support(attn_inputs: PyAttentionInputs) -> bool:
@@ -649,6 +649,7 @@ class PyFlashinferDecodeAttnOp(object):
             use_tensor_cores=self.use_tensor_core,
         )
         self.kv_cache_dtype = attn_configs.kv_cache_dtype
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
 
     def __del__(self):
         release_py_flashinfer_workspace_buffer(self.g_workspace_buffer)
@@ -674,9 +675,9 @@ class PyFlashinferDecodeAttnOp(object):
         )
         # Get torch.dtype from attention configs
         self.decode_wrapper.plan(
-            flashinfer_decode_params.decode_page_indptr_d,
-            flashinfer_decode_params.page_indice_d,
-            flashinfer_decode_params.paged_kv_last_page_len_d,
+            self.fmha_params.decode_page_indptr_d,
+            self.fmha_params.page_indice_d,
+            self.fmha_params.paged_kv_last_page_len_d,
             self.local_head_num,
             self.local_kv_head_num,
             self.head_dim_qk,

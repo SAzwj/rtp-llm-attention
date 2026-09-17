@@ -339,6 +339,7 @@ public:
 
     bool needFinish(int num_new_tokens = 1);
     bool needFinishBySPTokens(int num_new_tokens = 1);
+    void matchThinkTerminateToken();
     void matchEosToken();
     void matchEosToken(int batch_id);
     void matchStopWordsList();
@@ -775,10 +776,15 @@ public:
 
 public:
     struct TimeInfo {
-        int64_t begin_time_us;
-        int64_t wait_time_us;
-        int64_t first_token_time_us;
-        int64_t first_token_rt_us;
+        int64_t begin_time_us           = 0;
+        int64_t wait_time_us            = 0;  // legacy metric/metadata field
+        bool    running_started         = false;
+        int64_t running_started_time_us = 0;
+        bool    first_token_committed   = false;
+        int64_t first_token_time_us     = 0;
+        int64_t first_token_rt_us       = 0;
+        bool    generation_done         = false;
+        int64_t generation_done_time_us = 0;
     };
     TimeInfo getTimeInfo();
     bool     queryPdSep() const;
@@ -814,6 +820,10 @@ protected:
     int64_t                               begin_time_us_;
     int64_t                               wait_time_us_                       = 0;
     bool                                  wait_time_recorded_                 = false;
+    bool                                  running_started_                    = false;
+    int64_t                               running_started_time_us_            = 0;
+    bool                                  generation_done_                    = false;
+    int64_t                               generation_done_time_us_            = 0;
     int64_t                               speculative_verify_rounds_          = 0;
     int64_t                               speculative_accepted_token_num_     = 0;
     int64_t                               speculative_proposed_draft_tokens_  = 0;
@@ -850,6 +860,8 @@ protected:
     int     remote_reuse_length_                         = 0;
     int     memory_reuse_length_                         = 0;
     int     reuse_mm_length_                             = 0;
+    int     think_token_scan_position_                   = 0;
+    bool    think_naturally_closed_                      = false;
     // prefill reuse info (PD-sep); read/write only under output_mutex_
     int64_t prefill_total_reuse_len_  = 0;
     int64_t prefill_local_reuse_len_  = 0;
