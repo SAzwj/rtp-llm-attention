@@ -289,6 +289,7 @@ bool PrefillGenerateContext::finalizePriorityPreemption() {
     tryCancelDownstream();
     (void)closeGrpcStream();
 
+    auto finalized_stream = stream_;
     if (stream_) {
         stream_->reportError(ErrorCode::PRIORITY_PREEMPTED, "preempted by a higher-priority request");
         // A Prefill stream is scheduler-owned once published. Retry on the
@@ -304,8 +305,10 @@ bool PrefillGenerateContext::finalizePriorityPreemption() {
     }
 
     if (meta) {
-        meta->markPriorityPreemptionCanceled(
-            request_id, static_cast<int64_t>(ErrorCode::PRIORITY_PREEMPTED), "preempted by a higher-priority request");
+        meta->markPriorityPreemptionCanceled(request_id,
+                                             static_cast<int64_t>(ErrorCode::PRIORITY_PREEMPTED),
+                                             "preempted by a higher-priority request",
+                                             finalized_stream);
     }
     priority_finalized_ = true;
     return true;

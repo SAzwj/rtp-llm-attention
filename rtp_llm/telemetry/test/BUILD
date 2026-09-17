@@ -1,4 +1,4 @@
-load("@arch_config//:arch_select.bzl", "telemetry_test_deps")
+load("//bazel:arch_select.bzl", "telemetry_test_deps")
 
 py_test(
     name = "test_tracing",
@@ -10,6 +10,13 @@ py_test(
     deps = [
         "//rtp_llm:telemetry",
     ] + telemetry_test_deps(),
+)
+
+py_test(
+    name = "test_trace_config",
+    srcs = ["test_trace_config.py"],
+    data = ["trace_config_cases.json"],
+    deps = ["//rtp_llm:telemetry"] + telemetry_test_deps(),
 )
 
 py_test(

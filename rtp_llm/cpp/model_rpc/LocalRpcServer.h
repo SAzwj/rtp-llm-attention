@@ -150,6 +150,14 @@ protected:
                                   WriterInterface*                 writer,
                                   std::shared_ptr<GenerateStream>& stream);
 
+    // Shared helpers for single and batch paths
+    ErrorInfo prepareInput(const GenerateInputPB&                                              input_pb,
+                           std::shared_ptr<GenerateInput>&                                     output,
+                           const opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>& parent_span = {});
+    ErrorInfo
+    updateMultimodalFeaturesWithTrace(std::shared_ptr<GenerateInput>&                                     input,
+                                      const opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>& parent_span);
+
 protected:
     std::shared_ptr<EngineBase>           engine_;
     std::shared_ptr<MultimodalProcessor>  mm_processor_;

@@ -187,6 +187,9 @@ def triton_deps(names):
 def internal_deps():
     return []
 
+def telemetry_test_deps():
+    return []
+
 def jit_deps():
     return []
 

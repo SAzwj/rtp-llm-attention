@@ -1,5 +1,7 @@
 package org.flexlb.dao;
 
+import com.google.protobuf.ByteString;
+import io.opentelemetry.context.Context;
 import lombok.Data;
 import lombok.ToString;
 import org.flexlb.config.FlexlbConfig;
@@ -27,6 +29,10 @@ public class BalanceContext {
 
     @ToString.Exclude
     private byte[] generateInputPbBytes;
+
+    /** Captured at RPC entry and carried through asynchronous scheduling. */
+    @ToString.Exclude
+    private Context traceContext;
 
     //======================== Queue ========================//
 

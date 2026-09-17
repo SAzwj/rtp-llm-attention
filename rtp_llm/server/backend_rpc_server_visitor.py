@@ -480,8 +480,8 @@ class BackendRPCServerVisitor:
     async def route_ips(self, input: GenerateInput):
         route_span = start_internal_span("rtp_llm.master_route")
         if route_span is not None:
-            route_span.set_attribute("request_id", str(input.request_id))
-            route_span.set_attribute("rtp_llm.request_id", input.request_id)
+            # Bailian Unitrace index key (see rtp_llm/telemetry/attributes.py)
+            route_span.set_attribute(trace_attrs.REQUEST_ID, str(input.request_id))
         route_source = "none"
         route_error_type = ""
         try:

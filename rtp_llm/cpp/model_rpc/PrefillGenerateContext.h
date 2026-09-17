@@ -95,11 +95,18 @@ public:
     bool                            isRequestCancelled() const override;
     PriorityPreemptionRequestResult requestPriorityPreempt();
     bool                            isPriorityPreempted() const;
-    bool                            tryMarkOtherTerminal();
-    PrefillTerminalCause            terminalCause() const;
-    void                            tryCancelDownstream();
-    bool                            finalizePriorityPreemption();
-    void                            setLocalStreamSchedulerOwned(bool owned);
+    // Virtual so lifecycle tests can pause immediately after terminal publication.
+    virtual bool         tryMarkOtherTerminal();
+    PrefillTerminalCause terminalCause() const;
+    void                 tryCancelDownstream();
+    bool                 finalizePriorityPreemption();
+    void                 setLocalStreamSchedulerOwned(bool owned);
+    bool                 multimodalProcessed() const {
+        return multimodal_processed_input_.lock() == generate_input && generate_input != nullptr;
+    }
+    void markMultimodalProcessed() {
+        multimodal_processed_input_ = generate_input;
+    }
     // Linearizes ordinary runtime-meta removal with installation of the
     // priority-preemption first cause and its CANCELING overlay.
     void         dequeueStreamFromRuntimeMeta();
@@ -110,9 +117,10 @@ public:
     std::unique_ptr<telemetry::RequestSpanGuard> pd_client_span_guard;
 
 private:
-    void markRequestEnd();
-    void reportTime();
-    void stopStream();
+    std::weak_ptr<GenerateInput> multimodal_processed_input_;
+    void                         markRequestEnd();
+    void                         reportTime();
+    void                         stopStream();
 
     // The batch envelope exists before QueryConverter/local enqueue. Use the
     // same immutable identity for early Cancel and late stream registration.
@@ -134,6 +142,7 @@ public:
     std::shared_ptr<ClientStream>        client_stream;
     std::shared_ptr<std::atomic<bool>>   cancel_state;
     bool                                 grpc_stream_closed             = false;
+    bool                                 supports_prefill_completion    = false;
     grpc::Status                         last_grpc_stream_closed_status = grpc::Status::OK;
     PrefillStatInfo                      stat_info;
     int64_t                              loading_cache_requests               = 0;

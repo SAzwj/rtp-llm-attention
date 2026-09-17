@@ -4167,7 +4167,6 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(MasterClient._extract_priority(input_no_priority), 50)
 
 
-@unittest.skipUnless(tracing.OTEL_AVAILABLE, "opentelemetry not installed")
 class DashScInferenceTracingTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -4267,12 +4266,15 @@ class DashScInferenceTracingTest(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        responses = await _drain(
-            servicer.ModelStreamInfer(
-                _areq_iter([request]),
-                _FakeGrpcContext(metadata),
+        with patch.object(
+            servicer, "_next_rtp_llm_request_id", return_value=3540218608800727041
+        ):
+            responses = await _drain(
+                servicer.ModelStreamInfer(
+                    _areq_iter([request]),
+                    _FakeGrpcContext(metadata),
+                )
             )
-        )
 
         self.assertEqual(len(responses), 1)
         spans = {span.name: span for span in self._finished_spans()}
@@ -4301,10 +4303,9 @@ class DashScInferenceTracingTest(unittest.IsolatedAsyncioTestCase):
             server.attributes["rpc.method"],
             "GRPCInferenceService/ModelStreamInfer",
         )
-        self.assertEqual(
-            server.attributes["request_id"],
-            str(server.attributes["rtp_llm.request_id"]),
-        )
+        self.assertEqual(server.attributes["request_id"], "3540218608800727041")
+        self.assertIsInstance(server.attributes["request_id"], str)
+        self.assertNotIn("rtp_llm.request_id", server.attributes)
         self.assertIn("traceparent", dict(visitor.metadata[0]))
         self.assertEqual(server.status.status_code.name, "OK")
         self.assertEqual(client.status.status_code.name, "OK")

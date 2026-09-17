@@ -155,8 +155,6 @@ DEFAULT_FLEXLB_CONFIG='{
     }
   }
 }'
-OTEL_TRACE_SKIP_PATTERN="${OTEL_TRACE_SKIP_PATTERN:-.*}"
-OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-none}"
 HIPPO_ROLE="${HIPPO_ROLE:-flexlb_eval_master}"
 
 # These are independent transport settings, not FLEXLB_CONFIG fields.
@@ -669,8 +667,6 @@ if [[ "${START_FLEXLB}" == "1" ]]; then
   if [[ -n "${FLEXLB_START_CMD:-}" ]]; then
     env "${FLEXLB_ENV_ARGS[@]}" "${PROCESS_ENV_ARGS[@]}" "${RUNTIME_OVERRIDE_ENV_ARGS[@]}" \
       "FLEXLB_CONFIG=${FLEXLB_CONFIG}" \
-      "OTEL_TRACE_SKIP_PATTERN=${OTEL_TRACE_SKIP_PATTERN}" \
-      "OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}" \
       "HIPPO_ROLE=${HIPPO_ROLE}" \
       "FLEXLB_LOG_PATH=${FLEXLB_LOG_PATH}" \
       bash -lc "${FLEXLB_START_CMD}" >"${RUN_DIR}/flexlb.log" 2>&1 &
@@ -680,8 +676,6 @@ if [[ "${START_FLEXLB}" == "1" ]]; then
     fi
     env "${FLEXLB_ENV_ARGS[@]}" "${PROCESS_ENV_ARGS[@]}" "${RUNTIME_OVERRIDE_ENV_ARGS[@]}" \
       "FLEXLB_CONFIG=${FLEXLB_CONFIG}" \
-      "OTEL_TRACE_SKIP_PATTERN=${OTEL_TRACE_SKIP_PATTERN}" \
-      "OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}" \
       "HIPPO_ROLE=${HIPPO_ROLE}" \
       "FLEXLB_LOG_PATH=${FLEXLB_LOG_PATH}" \
       java -XX:StartFlightRecording=filename=${JFR_FILE},settings=profile,duration=${JFR_DURATION},disk=true,maxsize=256m,dumponexit=true "${JAVA_HEAP_OPTS[@]}" "${JAVA_MODULE_OPTS[@]}" "${JVM_SYSTEM_PROPS[@]}" -jar "${FLEXLB_JAR}" \

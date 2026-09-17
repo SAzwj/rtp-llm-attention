@@ -53,8 +53,6 @@ PERF_CONFIG_FILE="${PERF_CONFIG_DIR}/cancel_smoke_perf.json"
 DEFAULT_FLEXLB_CONFIG='{"schemaVersion":1,"scheduler":{"type":"QUEUE","ordering":{"type":"PRIORITY","defaultPriority":50,"preemption":{"allowedVictimStages":["DECODE_RESERVED","DECODE_ENGINE_OWNED"],"engineCancellation":{"ackTimeoutMs":50,"completionTimeoutMs":1000}}},"capacity":{"maxOutstandingRequestsGlobal":5000}},"dispatcher":{"type":"BATCH","maxRequests":32,"maxCollectionWaitMs":10,"maxWaitingRequestsPerPrefillWorker":1024,"earlyDispatchPredictedExecutionMs":550,"maxInflightBatchesPerPrefillWorker":4,"enqueueRpcTimeoutMs":5000},"router":{"availabilityHysteresisPercent":30,"roles":{"prefill":{"availability":{"maxPendingRequests":100000},"executionTimeEstimator":{"type":"FORMULA"},"selector":{"type":"ESTIMATED_TTFT","candidateChoice":{"type":"RANDOM_WITHIN_TOLERANCE"}}},"decode":{"availability":{"maxKvUsagePercent":90,"maxEngineRequests":1},"kvReservation":{"maxOutputTokensForEstimate":1000},"selector":{"type":"KV_USAGE_WEIGHTED_RANDOM"}},"vit":{"selector":{"type":"RANDOM"}}}}}'
 FLEXLB_CONFIG="${FLEXLB_CONFIG:-${DEFAULT_FLEXLB_CONFIG}}"
 
-OTEL_TRACE_SKIP_PATTERN="${OTEL_TRACE_SKIP_PATTERN:-.*}"
-OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-none}"
 HIPPO_ROLE="${HIPPO_ROLE:-flexlb_cancel_smoke_master}"
 
 PREFILL_REQUEST_CAP="${PREFILL_REQUEST_CAP:-0}"
@@ -249,8 +247,6 @@ if [[ "${START_FLEXLB}" == "1" ]]; then
 
   env "${FLEXLB_ENV_ARGS[@]}" \
     "FLEXLB_CONFIG=${FLEXLB_CONFIG}" \
-    "OTEL_TRACE_SKIP_PATTERN=${OTEL_TRACE_SKIP_PATTERN}" \
-    "OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}" \
     "HIPPO_ROLE=${HIPPO_ROLE}" \
     "FLEXLB_EXPECT_FETCH_RESPONSE=true" \
     java "${JAVA_MODULE_OPTS[@]}" -jar "${FLEXLB_JAR}" \

@@ -594,7 +594,6 @@ class FrontendServer(object):
         )
         if trace_state is not None:
             trace_state.set_attribute("request_id", str(request_id))
-            trace_state.set_attribute("rtp_llm.request_id", request_id)
             trace_state.set_attribute(trace_attrs.HTTP_REQUEST_METHOD, "POST")
             trace_state.set_attribute(trace_attrs.HTTP_METHOD, "POST")
 

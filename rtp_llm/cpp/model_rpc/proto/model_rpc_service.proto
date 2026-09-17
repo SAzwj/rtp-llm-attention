@@ -152,12 +152,18 @@ message MultimodalOutputsPB {
     repeated MultimodalOutputPB multimodal_outputs = 1;
 }
 
+message TraceContextPB {
+    string traceparent = 1;
+    string tracestate = 2;
+}
+
 message RequestInfoPB {
     string frontend_ip = 1;
     string dash_ip = 2;
     string trace_id = 3;
     string request_id = 4;
     string source_role = 5;
+    TraceContextPB trace_context = 6;
 }
 
 message GenerateInputPB {
@@ -246,6 +252,8 @@ message GenerateOutputsPB {
     google.protobuf.Int64Value frontend_context_execute_time_us = 14;
     google.protobuf.Int64Value frontend_context_execute_time_with_cache_us = 15;
     google.protobuf.Int64Value frontend_generate_execute_time_us = 16;
+    // Advertised only by the Decode ALLOCATE response.
+    bool supports_prefill_completion = 17;
 }
 
 // return to python client
@@ -295,6 +303,8 @@ enum RemoteStage {
     ALLOCATE = 0;
     LOAD = 1;
     GENERATE = 2;
+    // Prefill completed locally after LOAD; no Decode execution is required.
+    PREFILL_COMPLETE = 3;
 }
 
 message GenerateRequestPB {

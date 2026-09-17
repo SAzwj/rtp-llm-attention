@@ -14,6 +14,7 @@ import org.flexlb.dao.route.RoleType;
 import org.flexlb.engine.grpc.EngineGrpcClient;
 import org.flexlb.engine.grpc.EngineRpcService;
 import org.flexlb.engine.grpc.RoleTypeProtoConverter;
+import org.flexlb.telemetry.FlexlbTrace;
 import org.flexlb.util.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -186,6 +187,15 @@ public class DefaultBatchDispatcher implements BatchDispatcher {
         int prefillGrpcPort = prefillEp.getGrpcPort();
         CompletableFuture<EngineRpcService.EnqueueBatchResponsePB> rpcFuture;
         try {
+            long dispatchedNanos = System.nanoTime();
+            for (BatchItem item : items) {
+                item.ctx().setBatchDispatchedNanos(dispatchedNanos);
+                FlexlbTrace.setScheduleAttribute(item.ctx().getTraceContext(), FlexlbTrace.BATCH_ID, batchId);
+                FlexlbTrace.setScheduleAttribute(item.ctx().getTraceContext(), FlexlbTrace.BATCH_SIZE,
+                        (long) items.size());
+                FlexlbTrace.setScheduleAttribute(item.ctx().getTraceContext(), FlexlbTrace.DISPATCH_REASON,
+                        reason);
+            }
             attempt.rpcInvocationStarted = true;
             rpcFuture = grpcClient.batchEnqueueAsync(
                     prefillIp, prefillGrpcPort, request, deadlineMs);
@@ -303,7 +313,12 @@ public class DefaultBatchDispatcher implements BatchDispatcher {
             successIds.add(success.getRequestId());
         }
 
+        // Record a validated RPC response before callbacks can publish a
+        // Schedule response and end the request's SERVER span.
+        long responseNanos = System.nanoTime();
         for (BatchItem item : items) {
+            FlexlbTrace.setScheduleDuration(item.ctx().getTraceContext(), FlexlbTrace.ENQUEUE_BATCH_MS,
+                    item.ctx().getBatchDispatchedNanos(), responseNanos);
             try {
                 if (successIds.contains(item.requestId())) {
                     callback.onSuccess(item, batchId);
@@ -389,6 +404,23 @@ public class DefaultBatchDispatcher implements BatchDispatcher {
                 EngineRpcService.GenerateInputPB.parseFrom(bytes).toBuilder();
         if (input.getRequestId() != item.requestId()) {
             throw new IllegalArgumentException("request_id mismatch between schedule request and GenerateInputPB");
+        }
+        // This batch RPC carries independent requests. Propagate each Schedule
+        // parent in its own payload, never in the shared RPC metadata.
+        if (FlexlbTrace.isEnabled() && item.ctx().getTraceContext() != null) {
+            try {
+                var carrier = FlexlbTrace.inject(item.ctx().getTraceContext());
+                String traceparent = carrier.get("traceparent");
+                if (traceparent != null && !traceparent.isEmpty()) {
+                    var traceContext = input.getRequestInfo().getTraceContext().toBuilder()
+                            .setTraceparent(traceparent)
+                            .setTracestate(carrier.getOrDefault("tracestate", ""))
+                            .build();
+                    input.getRequestInfoBuilder().setTraceContext(traceContext);
+                }
+            } catch (Throwable ignored) {
+                // Tracing must not prevent dispatch or erase the incoming carrier.
+            }
         }
         EngineRpcService.GenerateConfigPB.Builder config = input.getGenerateConfigBuilder();
         config.clearRoleAddrs();

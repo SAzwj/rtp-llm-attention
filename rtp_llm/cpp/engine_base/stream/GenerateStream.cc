@@ -846,6 +846,21 @@ bool GenerateStream::isFinished() const {
     return getStatus() == StreamState::FINISHED;
 }
 
+bool GenerateStream::finishWithoutGenerate() {
+    checkTimeout();
+    {
+        std::lock_guard<std::mutex> lock(*mutex_);
+        if (getStatus() != StreamState::WAITING || generate_status_->error_info.hasError()) {
+            return false;
+        }
+        // No token was generated here: do not publish GenerateDone or execution timing.
+        generate_status_->status.store(StreamState::FINISHED, std::memory_order_release);
+        cv_->notify_all();
+    }
+    releaseResource();
+    return true;
+}
+
 bool GenerateStream::isActive() const {
     return !hasError() && getStatus() != StreamState::FINISHED;
 }

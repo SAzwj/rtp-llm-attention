@@ -9,6 +9,7 @@
 #include "rtp_llm/cpp/model_rpc/RemoteRpcServiceImpl.h"
 #include <condition_variable>
 #include <mutex>
+#include "rtp_llm/cpp/telemetry/TelemetryRuntime.h"
 
 namespace th = torch;
 
@@ -24,7 +25,8 @@ public:
                  py::object vit_config,
                  py::object mm_process_engine,
                  py::object propose_model,
-                 py::object token_processor);
+                 py::object token_processor,
+                 py::object trace_config = py::none());
     size_t  onflightRequestNum() const;
     int64_t completedSteps() const;
     void    armStop(int64_t target_step);
@@ -50,7 +52,8 @@ private:
     void                                          initRPCServer(const EngineInitParams                        maga_init_params,
                                                                 py::object                                    mm_process_engine,
                                                                 std::unique_ptr<ProposeModelEngineInitParams> propose_params,
-                                                                py::object                                    token_processor);
+                                                                py::object                                    token_processor,
+                                                                telemetry::TelemetryConfig                    trace_config);
 
 private:
     std::unique_ptr<RpcServiceImpl> model_rpc_service_;

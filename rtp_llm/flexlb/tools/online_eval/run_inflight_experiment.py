@@ -76,9 +76,7 @@ DEFAULT_FLEXLB_CONFIG = json.dumps(
                     },
                     "selector": {
                         "type": "ESTIMATED_TTFT",
-                        "candidateChoice": {
-                            "type": "RANDOM_WITHIN_TOLERANCE"
-                        },
+                        "candidateChoice": {"type": "RANDOM_WITHIN_TOLERANCE"},
                     },
                 },
                 "decode": {
@@ -265,8 +263,7 @@ def start_flexlb_master(experiment_dir: Path) -> subprocess.Popen:
     full_env.update(endpoint_env)
     full_env.update(process_env)  # process config overrides endpoint env
     full_env["FLEXLB_CONFIG"] = DEFAULT_FLEXLB_CONFIG
-    full_env["OTEL_TRACE_SKIP_PATTERN"] = ".*"
-    full_env["OTEL_EXPORTER_OTLP_ENDPOINT"] = "none"
+    full_env["RTP_LLM_TRACE_CONFIG"] = '{"enabled":false}'
     full_env["HIPPO_ROLE"] = "flexlb_eval_master"
 
     heap_size = process_env.get("FLEXLB_JVM_HEAP_SIZE", "4g")
