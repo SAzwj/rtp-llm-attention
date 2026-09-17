@@ -216,13 +216,23 @@ TelemetryConfig TelemetryConfig::fromEnv() {
 bool TelemetryRuntime::initInternal(std::unique_ptr<trace_sdk::SpanExporter> exporter, const TelemetryConfig& config) {
     // Caller holds globals().mutex.
     auto& g = globals();
+    // Single derivation point shared by BOTH entry points (init() and
+    // initWithExporter()). Role-split components: an empty service_name derives
+    // from the deployment role (rtp_llm_prefill / rtp_llm_decode /
+    // rtp_llm_pdfusion) so the Unitrace topology shows P/D as separate nodes;
+    // an explicit RTP_LLM_OTEL_SERVICE_NAME still overrides globally. Resolving
+    // here rather than in init() keeps the test entry on the same contract as
+    // production, so a broken derivation can no longer pass the tests.
+    const std::string service_name = !config.service_name.empty() ?
+                                         config.service_name :
+                                         (config.role.empty() ? std::string("rtp_llm") : "rtp_llm_" + config.role);
     try {
         // 1. Resource: service.instance.id carries per-process
         // identity; host.ip is written ONLY when a real pod IP is available and
         // is never synthesized from hostname-pid, which would misrepresent the
         // node address to topology views.
         resource::ResourceAttributes attributes{
-            {"service.name", config.service_name},
+            {"service.name", service_name},
             {"service.instance.id", getEnvString("HOSTNAME", "unknown") + "-" + std::to_string(getpid())},
             {"process.pid", (int64_t)getpid()},
             {"rtp_llm.role", config.role},
@@ -269,7 +279,7 @@ bool TelemetryRuntime::initInternal(std::unique_ptr<trace_sdk::SpanExporter> exp
         RTP_LLM_LOG_INFO("telemetry runtime active: role=%s tp_rank=%ld service=%s",
                          config.role.c_str(),
                          (long)config.tp_rank,
-                         config.service_name.c_str());
+                         service_name.c_str());
         return true;
     } catch (const std::exception&) {
         g.state = TelemetryState::INIT_FAILURE;
@@ -298,13 +308,9 @@ bool TelemetryRuntime::init(const std::string& role, int64_t tp_rank, int64_t dp
     config.tp_rank         = tp_rank;
     config.dp_rank         = dp_rank;
     config.world_rank      = world_rank;
-    // Role-split components: default service.name derives from the deployment
-    // role (rtp_llm_prefill / rtp_llm_decode / rtp_llm_pdfusion) so the
-    // Unitrace topology shows P/D nodes as separate components; an explicit
-    // RTP_LLM_OTEL_SERVICE_NAME still overrides globally.
-    if (config.service_name.empty()) {
-        config.service_name = "rtp_llm_" + role;
-    }
+    // service_name stays as resolved by fromEnv(): an empty value is derived
+    // from the role inside initInternal(), the single point both entry points
+    // share.
 
     if (!config.enabled) {
         g.state = TelemetryState::DISABLED;

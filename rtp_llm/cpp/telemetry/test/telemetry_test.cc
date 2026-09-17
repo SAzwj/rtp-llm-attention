@@ -273,7 +273,55 @@ TEST_F(TelemetryTest, ResourceCarriesReplicaIdentityRanks) {
     EXPECT_EQ(opentelemetry::nostd::get<int64_t>(res.at("rtp_llm.dp_rank")), 1);
     ASSERT_NE(res.find("rtp_llm.world_rank"), res.end());
     EXPECT_EQ(opentelemetry::nostd::get<int64_t>(res.at("rtp_llm.world_rank")), 2);
+    // The role-derived service.name is what production actually exports; without
+    // this assertion the test entry point could silently keep the plain
+    // "rtp_llm" default while init() derived a different name.
+    ASSERT_NE(res.find("service.name"), res.end());
+    EXPECT_EQ(opentelemetry::nostd::get<std::string>(res.at("service.name")), "rtp_llm_decode");
     EXPECT_TRUE(TelemetryRuntime::shutdown(5000));
+}
+
+// Resolution contract shared by init() and initWithExporter(): an empty
+// service_name derives from the role, while an explicit one always wins.
+TEST_F(TelemetryTest, ServiceNameDerivesFromRoleUnlessExplicitlySet) {
+    auto exportedServiceName = [](const std::string& role, const std::string& explicit_service_name) {
+        std::shared_ptr<memory_exporter::InMemorySpanData> span_data;
+        auto            exporter = memory_exporter::InMemorySpanExporterFactory::Create(span_data);
+        TelemetryConfig config;
+        config.enabled = true;
+        // Fast BSP flush: the resource must be read before shutdown destroys the
+        // provider (SpanData::SetResource stores a raw pointer into it).
+        config.schedule_delay_ms = 1;
+        config.role              = role;
+        config.service_name      = explicit_service_name;
+        EXPECT_TRUE(TelemetryRuntime::initWithExporter(std::move(exporter), config));
+
+        TelemetryRuntime::tracer()->StartSpan("probe")->End();
+        std::vector<std::unique_ptr<opentelemetry::sdk::trace::SpanData>> spans;
+        for (int i = 0; i < 200 && spans.empty(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            spans = span_data->GetSpans();
+        }
+        EXPECT_EQ(spans.size(), 1u);
+        std::string exported;
+        if (!spans.empty()) {
+            const auto& res = spans[0]->GetResource().GetAttributes();
+            auto        it  = res.find("service.name");
+            if (it != res.end()) {
+                exported = opentelemetry::nostd::get<std::string>(it->second);
+            }
+        }
+        EXPECT_TRUE(TelemetryRuntime::shutdown(5000));
+        return exported;
+    };
+
+    // Empty service_name: P and D must land as separate topology components.
+    EXPECT_EQ(exportedServiceName("decode", ""), "rtp_llm_decode");
+    EXPECT_EQ(exportedServiceName("prefill", ""), "rtp_llm_prefill");
+    // An explicit name is a global override and must never be role-mangled.
+    EXPECT_EQ(exportedServiceName("decode", "custom_service"), "custom_service");
+    // No role at all still yields the plain base name, never a trailing "_".
+    EXPECT_EQ(exportedServiceName("", ""), "rtp_llm");
 }
 
 TEST_F(TelemetryTest, GuardAddEventCarriesExplicitTimestamp) {
@@ -555,8 +603,8 @@ TEST_F(TelemetryTest, GrpcStatusDescriptionsArePredictableAndHumanReadable) {
 }
 
 TEST_F(TelemetryTest, UsageTokenAttributesFiveKeyDoubleWrite) {
-    // Per-hop usage contract parity with rtp_llm/telemetry/attributes.py:
-    // semconv input/output + legacy prompt/completion aliases + total.
+    // Per-hop usage contract: semconv input/output + legacy prompt/completion
+    // aliases + total.
     auto span_data = startInMemoryRuntime();
     {
         RequestSpanGuard guard(TelemetryRuntime::tracer()->StartSpan("decode"));

@@ -1,4 +1,4 @@
-load("//bazel:arch_select.bzl", "telemetry_test_deps")
+load("@arch_config//:arch_select.bzl", "telemetry_test_deps")
 
 py_test(
     name = "test_tracing",
@@ -10,4 +10,13 @@ py_test(
     deps = [
         "//rtp_llm:telemetry",
     ] + telemetry_test_deps(),
+)
+
+py_test(
+    name = "trace_attributes_parity_test",
+    srcs = ["trace_attributes_parity_test.py"],
+    data = [
+        "//rtp_llm:telemetry",
+        "//rtp_llm/cpp/telemetry:TraceAttributes.h",
+    ],
 )

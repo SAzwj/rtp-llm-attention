@@ -267,12 +267,11 @@ inline void injectSpanToClientContext(grpc::ClientContext* client_context,
 }
 
 // Writes the gen_ai.usage token attributes on a per-role gRPC SERVER span
-// (the follow-up documented in rtp_llm/telemetry/attributes.py: per-hop token
-// breakdown beyond the frontend HTTP span). Five-key double-write mirrors the
-// Python contract exactly: current semconv input/output, legacy
-// prompt/completion aliases (some platform views only read those older names)
-// and total_tokens (the LLM view aggregates it). Values <= 0 are
-// skipped: partial usage is worse than none for platform aggregation.
+// (per-hop token breakdown beyond the frontend HTTP span). Five-key
+// double-write follows the cross-language usage contract: current semconv
+// input/output, legacy prompt/completion aliases (some platform views only read
+// those older names) and total_tokens (the LLM view aggregates it). Values <= 0
+// are skipped: partial usage is worse than none for platform aggregation.
 template<typename SpanLike>
 inline void setUsageTokenAttributes(SpanLike& span_like, int64_t input_tokens, int64_t output_tokens) noexcept {
     try {

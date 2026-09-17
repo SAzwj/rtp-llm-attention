@@ -33,8 +33,11 @@ struct TelemetryConfig {
     int64_t schedule_delay_ms     = 5000;
     size_t  max_export_batch_size = 512;
     int64_t http_timeout_ms       = 3000;
-    // Env: RTP_LLM_OTEL_SERVICE_NAME, default "rtp_llm"
-    std::string service_name = "rtp_llm";
+    // Env: RTP_LLM_OTEL_SERVICE_NAME. Empty means "derive from role during
+    // initialization" (rtp_llm_<role>, or plain "rtp_llm" when role is empty).
+    // Both entry points resolve this identically in initInternal(), so a
+    // directly constructed config behaves exactly like the production one.
+    std::string service_name;
 
     // Process identity set by caller, not env.
     std::string role;  // frontend / prefill / decode / pdfusion

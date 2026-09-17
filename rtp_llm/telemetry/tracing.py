@@ -141,7 +141,7 @@ def _endpoint_log_target(endpoint: str) -> str:
 
 
 def _resolve_region_config() -> None:
-    """Resolve endpoint/headers/CA from a region config file (internal-only).
+    """Resolve endpoint/headers/CA from a region config file.
 
     Priority: an explicit endpoint/headers/certificate carrier always wins as
     a whole.  When RTP_LLM_OTEL_REGION is set and no explicit carrier exists,
@@ -153,7 +153,7 @@ def _resolve_region_config() -> None:
     Config file search order:
       1. RTP_LLM_OTEL_REGION_CONFIG_FILE env var
       2. /etc/rtp_llm/trace_regions.json (operator-mounted secret)
-      3. <workspace>/internal_source/rtp_llm/telemetry/trace_regions.json (dev)
+      3. A development-local region config discovered alongside the workspace.
     """
     region = os.environ.get("RTP_LLM_OTEL_REGION", "")
     if not region:
@@ -162,7 +162,7 @@ def _resolve_region_config() -> None:
     config_path = os.environ.get("RTP_LLM_OTEL_REGION_CONFIG_FILE", "")
     if not config_path or not os.path.isfile(config_path):
         candidates = ["/etc/rtp_llm/trace_regions.json"]
-        # Dev: search upward from this file for internal_source/
+        # Development fallback: search upward for a workspace-provided config.
         _parent = os.path.dirname(os.path.abspath(__file__))
         for _ in range(5):
             _c = os.path.join(
@@ -245,8 +245,7 @@ def _resolve_region_config() -> None:
             "certificate"
         ]
 
-    # Commit only after the complete entry has been validated, while preserving
-    # every explicitly configured environment value.
+    # Commit only after the complete entry has been validated.
     if not resolved_env.get("OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE"):
         for cand in (
             "/etc/pki/tls/certs/ca-bundle.crt",
@@ -271,8 +270,11 @@ def resolve_region_env() -> None:
     Must run in the top-level launcher BEFORE child processes spawn: the C++
     backend reads OTEL_EXPORTER_OTLP_TRACES_* strictly from its inherited
     environment (TelemetryRuntime::init), and both runtimes read POD_IP for
-    host.ip. Idempotent (only fills unset keys) and fail-open.
+    host.ip. Disabled tracing is a pure no-op. Idempotent (only fills unset
+    keys) and fail-open.
     """
+    if not _env_bool("RTP_LLM_OTEL_TRACE_ENABLE", False):
+        return
     try:
         _resolve_region_config()
         # Scope version rides the same launcher->child env inheritance: the
@@ -399,6 +401,11 @@ def init_telemetry(role: str, tp_rank: int = 0) -> bool:
     """
     global _state, _provider
     with _state_lock:
+        if _state == TelemetryState.SHUTDOWN:
+            _LOGGER.warning(
+                "telemetry init requested after shutdown; reinitialization is not supported"
+            )
+            return False
         if _state == TelemetryState.ACTIVE:
             return True
         if not _env_bool("RTP_LLM_OTEL_TRACE_ENABLE", False):
@@ -466,6 +473,11 @@ def init_telemetry_for_test(
     """Test-only: initialize with an injected span exporter, bypassing env switch."""
     global _state
     with _state_lock:
+        if _state == TelemetryState.SHUTDOWN:
+            _LOGGER.warning(
+                "telemetry test init requested after shutdown; reinitialization is not supported"
+            )
+            return False
         if _state == TelemetryState.ACTIVE:
             _LOGGER.warning(
                 "telemetry init_for_test called while ACTIVE, call shutdown first"
@@ -971,6 +983,19 @@ class RequestTraceState:
 CURRENT_TRACE_STATE: ContextVar[Optional[RequestTraceState]] = ContextVar(
     "rtp_llm_current_trace_state", default=None
 )
+
+
+def reset_telemetry_for_test(deadline_ms: int = 2000) -> bool:
+    """Reset process telemetry state for test isolation only."""
+    if not shutdown_telemetry(deadline_ms):
+        return False
+
+    global _state, _provider
+    with _state_lock:
+        _provider = None
+        _state = TelemetryState.UNINITIALIZED
+    CURRENT_TRACE_STATE.set(None)
+    return True
 
 
 class ClientSpanHandle:

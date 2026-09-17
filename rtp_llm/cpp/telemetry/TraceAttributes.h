@@ -1,10 +1,9 @@
 #pragma once
 
-// Centralized C++ span attribute keys, mirroring rtp_llm/telemetry/attributes.py
-// (the single source of truth for the attribute schema; every key here must be
-// registered there with its consumer documented). Grouping follows the same
-// three-layer annotation: OTel official candidate / ARMS-Unitrace extension /
-// rtp_llm.* internal. Resource attributes such as host.ip and service.name are
+// Centralized C++ span attribute registry, mirroring the Python-side schema in
+// rtp_llm/telemetry/attributes.py; keep the two in sync. Grouping follows the
+// same three-layer annotation: OTel official candidate / ARMS-Unitrace extension
+// / rtp_llm.* internal. Resource attributes such as host.ip and service.name are
 // process identity and are intentionally not listed here.
 
 namespace rtp_llm {

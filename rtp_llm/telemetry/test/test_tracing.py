@@ -4,9 +4,9 @@ Run directly (conda310 interpreter) or via Bazel:
     /opt/conda310/bin/python -m unittest rtp_llm.telemetry.test.test_tracing -v
     bazelisk test //rtp_llm/telemetry/test:test_tracing
 
-unittest style on purpose (repo convention; pytest is not in any pip lock).
-opentelemetry comes from the execution image's interpreter site-packages (not
-in the public pip locks; rules_python here does not isolate system packages).
+unittest style on purpose (repo convention; pytest is not part of the test
+runtime). The dependency-contract test checks that the tracing SDK is available
+in the configured test environment rather than relying on an ambient import.
 The unskipped dependency-contract test prevents a missing runtime from turning
 the functional suite into an all-skip success.
 """
@@ -56,12 +56,7 @@ TELEMETRY_ENVS = [
 
 
 def _reset_runtime():
-    tracing.shutdown_telemetry()
-    # reset to pristine state so DISABLED verdicts from earlier tests don't leak
-    with tracing._state_lock:
-        tracing._state = tracing.TelemetryState.UNINITIALIZED
-        tracing._provider = None
-    tracing.CURRENT_TRACE_STATE.set(None)
+    assert tracing.reset_telemetry_for_test()
 
 
 def _start_in_memory_runtime():
@@ -131,6 +126,19 @@ class TestConfig(TracingTestCase):
         assert tracing.telemetry_state() == tracing.TelemetryState.DISABLED
         assert not tracing.is_telemetry_active()
 
+    def test_disabled_region_resolution_has_no_side_effects(self):
+        os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
+        os.environ["RequestedIP"] = "10.4.5.6"
+        with (
+            mock.patch.object(tracing, "_resolve_region_config") as resolve_config,
+            mock.patch.object(socket, "gethostbyname") as gethostbyname,
+        ):
+            tracing.resolve_region_env()
+        resolve_config.assert_not_called()
+        gethostbyname.assert_not_called()
+        assert "RTP_LLM_OTEL_SCOPE_VERSION" not in os.environ
+        assert "POD_IP" not in os.environ
+
     def test_enabled_without_endpoint_disabled(self):
         os.environ["RTP_LLM_OTEL_TRACE_ENABLE"] = "1"
         assert not tracing.init_telemetry("frontend", 0)
@@ -183,8 +191,11 @@ class TestConfig(TracingTestCase):
         os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = (
             "http://127.0.0.1:4318/v1/traces"
         )
-        with mock.patch.object(tracing, "OTEL_AVAILABLE", False), mock.patch.object(
-            tracing, "_OTEL_IMPORT_ERROR", ImportError("simulated"), create=True
+        with (
+            mock.patch.object(tracing, "OTEL_AVAILABLE", False),
+            mock.patch.object(
+                tracing, "_OTEL_IMPORT_ERROR", ImportError("simulated"), create=True
+            ),
         ):
             assert not tracing.init_telemetry("frontend", 0)
             assert tracing.telemetry_state() == tracing.TelemetryState.DISABLED
@@ -279,9 +290,7 @@ class TestConfig(TracingTestCase):
 
     def test_explicit_signal_credentials_reject_region_endpoint(self):
         os.environ["RTP_LLM_OTEL_REGION"] = "cn-test"
-        os.environ["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] = (
-            "authorization=explicit"
-        )
+        os.environ["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] = "authorization=explicit"
         config = {
             "regions": {
                 "cn-test": {
@@ -299,8 +308,7 @@ class TestConfig(TracingTestCase):
 
         assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in os.environ
         assert (
-            os.environ["OTEL_EXPORTER_OTLP_TRACES_HEADERS"]
-            == "authorization=explicit"
+            os.environ["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] == "authorization=explicit"
         )
         assert "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE" not in os.environ
 
@@ -408,6 +416,7 @@ class TestScopeVersion(TracingTestCase):
         assert spans[0].instrumentation_scope.version == "9.9.9-test"
 
     def test_resolve_region_env_exports_scope_version(self):
+        os.environ["RTP_LLM_OTEL_TRACE_ENABLE"] = "1"
         os.environ.pop("RTP_LLM_OTEL_SCOPE_VERSION", None)
         with mock.patch.object(tracing, "_scope_version_cache", "7.7.7-launcher"):
             tracing.resolve_region_env()
@@ -416,6 +425,10 @@ class TestScopeVersion(TracingTestCase):
 
 class TestResource(TracingTestCase):
     """Parity with the C++ runtime: host.ip only from POD_IP."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["RTP_LLM_OTEL_TRACE_ENABLE"] = "1"
 
     def _finished_resource_attributes(self, exporter):
         state = tracing.start_server_span("resource_probe", {})
@@ -466,11 +479,12 @@ class TestResource(TracingTestCase):
         assert os.environ["POD_IP"] == "10.7.8.9"
 
     def test_resolve_region_env_uses_hostname_ip(self):
-        with mock.patch.object(
-            socket, "gethostname", return_value="test-host"
-        ), mock.patch.object(
-            socket, "gethostbyname", return_value="10.7.8.9"
-        ) as gethostbyname:
+        with (
+            mock.patch.object(socket, "gethostname", return_value="test-host"),
+            mock.patch.object(
+                socket, "gethostbyname", return_value="10.7.8.9"
+            ) as gethostbyname,
+        ):
             tracing.resolve_region_env()
         assert os.environ["POD_IP"] == "10.7.8.9"
         gethostbyname.assert_called_once_with("test-host")
@@ -623,11 +637,7 @@ class TestActiveRuntime(TracingTestCase):
     def test_server_span_accepts_explicit_start_time(self):
         exporter = _start_in_memory_runtime()
         start_time = time.time_ns() - 1_000_000
-        state = tracing.start_server_span(
-            "delayed",
-            {},
-            start_time=start_time,
-        )
+        state = tracing.start_server_span("delayed", {}, start_time=start_time)
         assert state is not None
         state.finish()
         tracing.shutdown_telemetry()
@@ -702,7 +712,7 @@ class TestActiveRuntime(TracingTestCase):
         state.finish()
         tracing.shutdown_telemetry()
         span = exporter.get_finished_spans()[0]
-        assert abs(span.attributes[attrs.GEN_AI_TIME_TO_FIRST_TOKEN] - 50.0) < 1e-6
+        assert abs(span.attributes["gen_ai.response.time_to_first_token"] - 50.0) < 1e-6
 
     def test_inject_extract_roundtrip(self):
         _start_in_memory_runtime()
@@ -859,6 +869,29 @@ class TestActiveRuntime(TracingTestCase):
         assert tracing.shutdown_telemetry()
         assert tracing.telemetry_state() == tracing.TelemetryState.SHUTDOWN
         assert tracing.shutdown_telemetry()
+
+    def test_reset_telemetry_for_test_restores_fixture_state(self):
+        _start_in_memory_runtime()
+        tracing.CURRENT_TRACE_STATE.set(mock.sentinel.trace_state)
+        assert tracing.shutdown_telemetry()
+
+        self.assertTrue(tracing.reset_telemetry_for_test())
+        self.assertEqual(
+            tracing.telemetry_state(), tracing.TelemetryState.UNINITIALIZED
+        )
+        self.assertIsNone(tracing.CURRENT_TRACE_STATE.get())
+        self.assertIsNotNone(_start_in_memory_runtime())
+
+    def test_shutdown_is_terminal_for_reinitialization(self):
+        _start_in_memory_runtime()
+        assert tracing.shutdown_telemetry()
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        self.assertFalse(tracing.init_telemetry_for_test(InMemorySpanExporter()))
+        self.assertEqual(tracing.telemetry_state(), tracing.TelemetryState.SHUTDOWN)
+        self.assertIsNone(tracing.get_tracer())
 
 
 class TestClientSpan(TracingTestCase):
