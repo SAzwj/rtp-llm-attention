@@ -1,6 +1,42 @@
 load(":defs.bzl", "custom_smoke_test", "smoke_test")
 package(default_visibility = ["//visibility:public"])
 
+# Temporary CI matrix; the product defaults and original goldens stay unchanged.
+DYNAMIC_DECODE_CI_ARGS = "--quantization FP8_PER_BLOCK --act_type BF16 --warm_up 0 --seq_size_per_block 64 --prefill_chunk_size 64 --enable_cuda_graph 1 --decode_capture_config 1,2,4,8 --max_seq_len 8192 --max_batch_tokens_size 16384 --concurrency_limit 8 --kv_cache_mem_mb 4096 --reserver_runtime_mem_mb 8192"
+
+[
+    test_suite(
+        name = "dynamic_decode_ci_%s_%s" % (platform, kv),
+        tests = [
+            smoke_test(
+                name = "dynamic_decode_ci_%s_%s_tp%d_%s" % (platform, kv, tp, mode),
+                task_info = "data/model/qwen3/q_r_h20.json",
+                smoke_args = DYNAMIC_DECODE_CI_ARGS + " --disable_flashinfer_native 0 --tp_size %d --world_size %d --fp8_kv_cache %d --enable_dynamic_decode_backend %d" % (tp, tp, fp8, enabled),
+                gpu_type = [gpu],
+            )
+            for tp in [1, 2]
+            for mode, enabled in [("off", 0), ("on", 1)]
+        ],
+        tags = ["manual"],
+    )
+    for platform, gpu in [("h20", "H20_CU13"), ("sm100", "SM100_ARM_CU13")]
+    for kv, fp8 in [("bf16", 0), ("fp8", 1)]
+]
+
+test_suite(
+    name = "dynamic_decode_ci_h20_xqa",
+    tests = [
+        smoke_test(
+            name = "dynamic_decode_ci_h20_xqa_" + mode,
+            task_info = "data/model/qwen3/q_r_h20.json",
+            smoke_args = DYNAMIC_DECODE_CI_ARGS + " --disable_flashinfer_native 1 --enable_dynamic_decode_backend %d" % enabled,
+            gpu_type = ["H20_CU13"],
+        )
+        for mode, enabled in [("off", 0), ("on", 1)]
+    ],
+    tags = ["manual"],
+)
+
 # Framework source files for cross-package smoke tests.
 # Used as data dep (not srcs/deps) so internal smoke targets can merge their
 # own smoke/ children through smoke.__path__ without duplicating runner srcs.
