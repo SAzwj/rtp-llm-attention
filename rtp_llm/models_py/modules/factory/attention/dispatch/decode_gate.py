@@ -71,7 +71,16 @@ def build_decode_gate(records, expected, layer_ids, fp8):
                     raise ValueError(
                         "decode output does not match active batch/head dimensions"
                     )
-                verdict = evaluate_precision(actual.output, gold.output, fp8)
+                if gold.reference_contribution is None:
+                    raise ValueError(
+                        f"missing reference contribution: {scenario}/{phase}/{layer_id}"
+                    )
+                verdict = evaluate_precision(
+                    actual.output,
+                    gold.output,
+                    gold.reference_contribution,
+                    fp8,
+                )
                 details[name].append((scenario, phase, layer_id, verdict))
                 if not verdict["overall_pass"]:
                     passed.discard(name)

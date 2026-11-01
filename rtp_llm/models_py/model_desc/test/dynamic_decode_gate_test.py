@@ -17,17 +17,24 @@ from rtp_llm.models_py.modules.factory.attention.accuracy.attention_record impor
     AttentionForwardRecord,
     AttentionLayerRecord,
 )
+from rtp_llm.models_py.modules.factory.attention.accuracy.golden_sdpa_impl import (
+    GoldenSDPAImpl,
+)
 from rtp_llm.models_py.modules.factory.attention.accuracy.recording_wrapper import (
     RecordingWrapper,
 )
 from rtp_llm.models_py.modules.factory.attention.dispatch.decode_gate import (
     build_decode_gate,
 )
+from rtp_llm.models_py.modules.factory.attention.dispatch.decode_gate_calibration import (
+    calibrate,
+)
 from rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder import (
     GateRecorder,
     _GoldenFeedback,
 )
 from rtp_llm.models_py.modules.factory.attention.dispatch.precision_metrics import (
+    DecodeGateConfig,
     evaluate_precision,
 )
 from rtp_llm.models_py.modules.factory.attention.dispatch.selector import select_stable
@@ -38,7 +45,12 @@ from rtp_llm.ops.compute_ops import PyAttentionInputs
 def records_fixture():
     q = torch.ones(2, 2, 4, dtype=torch.bfloat16)
     layer = AttentionLayerRecord(
-        0, q, q[:, :1].clone(), q[:, :1].clone(), q.reshape(2, 8).clone()
+        0,
+        q,
+        q[:, :1].clone(),
+        q[:, :1].clone(),
+        q.reshape(2, 8).clone(),
+        torch.ones(2, 2),
     )
     records = {
         "s": {
@@ -129,22 +141,87 @@ class DecodeGateTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no scenarios"):
             build_decode_gate({}, {}, (0,), False)
 
-    def test_fp8_low_snr_retains_nrmse_gate(self):
-        golden = torch.ones(128, dtype=torch.bfloat16)
+    def test_low_signal_uses_contribution_budget(self):
+        golden = torch.ones(1, 128, dtype=torch.bfloat16)
         noise = torch.ones_like(golden) * 0.08
-        noise[::2] *= -1
-        fp8 = evaluate_precision(golden + noise, golden, True)
-        self.assertTrue(fp8["low_snr"])
+        noise[:, ::2] *= -1
+        # R=1 and S=4 select the low-signal branch independent of candidate error.
+        contribution = torch.full((1, 2), 4.0)
+        fp8 = evaluate_precision(golden + noise, golden, contribution, True)
+        self.assertEqual(fp8["low_signal_sequences"], [0])
         self.assertTrue(fp8["overall_pass"])
+
+    def test_reliable_signal_uses_classic_metrics(self):
+        golden = torch.ones(1, 128, dtype=torch.bfloat16)
+        noise = torch.ones_like(golden) * 0.08
+        noise[:, ::2] *= -1
+        contribution = torch.ones((1, 2))
+        verdict = evaluate_precision(golden + noise, golden, contribution, True)
+        self.assertEqual(verdict["low_signal_sequences"], [])
+        self.assertFalse(verdict["overall_pass"])
         self.assertFalse(
-            evaluate_precision(golden + noise, golden, False)["overall_pass"]
+            evaluate_precision(golden * 1.4, golden, contribution, True)["overall_pass"]
         )
-        self.assertFalse(evaluate_precision(golden * 1.4, golden, True)["overall_pass"])
 
     def test_zero_output_is_valid(self):
         self.assertTrue(
-            evaluate_precision(torch.zeros(8), torch.zeros(8), False)["overall_pass"]
+            evaluate_precision(
+                torch.zeros(1, 8),
+                torch.zeros(1, 8),
+                torch.zeros(1, 2),
+                False,
+            )["overall_pass"]
         )
+
+    def test_signal_class_does_not_depend_on_candidate_error(self):
+        golden = torch.ones(1, 8, dtype=torch.bfloat16)
+        contribution = torch.full((1, 2), 4.0)
+        config = DecodeGateConfig(gain_limit=100.0, budget_coefficient=1.0)
+        for candidate in (golden, golden * 100):
+            verdict = evaluate_precision(candidate, golden, contribution, True, config)
+            self.assertEqual(verdict["low_signal_sequences"], [0])
+
+    def test_golden_contribution_matches_weighted_v_formula(self):
+        impl = object.__new__(GoldenSDPAImpl)
+        impl.head_num = 2
+        impl.kv_head_num = 1
+        impl.scale = 1.0
+        q = torch.ones(1, 2, 4)
+        k = torch.zeros(8, 1, 4)
+        v = torch.ones(8, 1, 4)
+        contribution = impl._attention_contribution(q, k, v)
+        torch.testing.assert_close(contribution, torch.full((1, 2), 1.0 / 8**0.5))
+
+    def test_calibration_requires_normal_pass_and_fault_rejection(self):
+        normal = torch.ones(1, 8, dtype=torch.bfloat16)
+        records = [
+            dict(
+                candidate=normal,
+                reference=normal,
+                contribution=torch.ones(1, 2),
+                fp8=fp8,
+                kind="normal",
+                cohort=f"normal-{fp8}",
+            )
+            for fp8 in (False, True)
+        ] + [
+            dict(
+                candidate=normal * 2,
+                reference=normal,
+                contribution=torch.ones(1, 2),
+                fp8=fp8,
+                kind="scale",
+                cohort=f"scale-{fp8}",
+            )
+            for fp8 in (False, True)
+        ]
+        selected, _ = calibrate(
+            records,
+            [DecodeGateConfig()],
+            min_normal_pass=1.0,
+            min_fault_detection=1.0,
+        )
+        self.assertIn("fp8", selected)
 
     def test_golden_feedback_records_actual_output(self):
         configs = SimpleNamespace(head_num=2, kv_head_num=1, size_per_head=4)
