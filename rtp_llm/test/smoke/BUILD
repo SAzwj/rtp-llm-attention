@@ -1,6 +1,34 @@
 load(":defs.bzl", "SMOKE_FRAMEWORK_DEPS", "custom_smoke_test", "smoke_test")
 package(default_visibility = ["//visibility:public"])
 
+# Temporary H20 CI matrix for dynamic decode precision gating. Reuse graph
+# targets whose off path is already covered by smoke-light-sm9x. SM100 smoke
+# needs its own golden/calibration path before it can be an acceptance gate.
+DYNAMIC_DECODE_CI_FLASHINFER_ARGS = "--disable_flashinfer_native 0 --act_type BF16 --reserver_runtime_mem_mb 8192 --tp_size 1 --warm_up 0 --seq_size_per_block 64 --enable_xqa 0 --enable_flashinfer_trtllm_gen 0 --enable_flashinfer_trt_fmha_v2 0 --enable_paged_flashinfer_trt_fmha_v2 0 --enable_cuda_graph 1 --decode_capture_config 2"
+
+[
+    test_suite(
+        name = name,
+        tests = [
+            smoke_test(
+                name = name + "_" + mode,
+                task_info = task_info,
+                smoke_args = smoke_args + " --enable_dynamic_decode_backend %d" % enabled,
+                gpu_type = ["H20_CU13"],
+            )
+            for mode, enabled in [("off", 0), ("on", 1)]
+        ],
+        tags = ["manual"],
+    )
+    for name, task_info, smoke_args in [
+        (
+            "dynamic_decode_ci_h20_flashinfer",
+            "data/model/qwen3/q_r_block_fp8_flashinfer_decode.json",
+            DYNAMIC_DECODE_CI_FLASHINFER_ARGS,
+        ),
+    ]
+]
+
 # Framework source files for cross-package smoke tests.
 # Used as data dep (not srcs/deps) so internal smoke targets can merge their
 # own smoke/ children through smoke.__path__ without duplicating runner srcs.
