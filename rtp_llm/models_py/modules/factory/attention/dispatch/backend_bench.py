@@ -313,11 +313,8 @@ def bench_backend_grid(
         lats: List[float] = []
         for kv in kv_list:
             bench_inputs = _clone_attn_inputs(attn_inputs)
-            # Force CG mode on the clone: the harness always captures+replays, so the
-            # wrapper must be built in CG mode (fixed buffers). is_cuda_graph is still
-            # False on the engine inputs at selection time; leaving it False makes the
-            # impl non-CG, and CG-capturing a non-CG wrapper is undefined behavior
-            # (crash / hang / inflated replay).
+            # Capture requires fixed Graph buffers. Set the mode on the clone
+            # so benchmark preparation cannot change the engine's inputs.
             bench_inputs.is_cuda_graph = True
             for field in (
                 "kv_cache_kernel_block_id",
@@ -334,8 +331,7 @@ def bench_backend_grid(
                         ).reshape(bs, pages_per_sequence)
                     )
             _set_uniform_seq_len(bench_inputs, bs, kv)
-            # 3-arg unconditionally (all impls take parallelism_config=None); a TypeError
-            # fallback would mask a real internal TypeError, see instantiate_decode_impl.
+            # Constructor errors propagate to the selector's fatal boundary.
             impl = impl_cls(attn_configs, bench_inputs, parallelism_config)
             if not impl.support_cuda_graph():
                 del impl, bench_inputs, qkv
