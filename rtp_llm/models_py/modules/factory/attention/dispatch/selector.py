@@ -49,8 +49,8 @@ def select_stable(
 
     Level 2 (cluster tiebreaker): among survivors, if mutual differences are
     within cluster_margin, pick the one with highest priority in registry_order
-    (deterministic, noise-immune). Only when a backend is clearly faster than
-    all others (gap > cluster_margin) does it win outright.
+    (deterministic for a given timing matrix). Only when a backend is clearly
+    faster than all others (gap > cluster_margin) does it win outright.
 
     Registry order makes ties deterministic for a given timing matrix. Timing
     noise near either threshold can still change the winner between runs.
