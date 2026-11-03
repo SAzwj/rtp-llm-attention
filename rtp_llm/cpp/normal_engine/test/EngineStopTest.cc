@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <future>
 #include <memory>
 #include <string>
@@ -9,6 +10,7 @@
 
 #define private public
 #define protected public
+#include "rtp_llm/cpp/normal_engine/accuracy/AccuracyChecker.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/normal_engine/test/MockEngine.h"
 #undef protected
@@ -113,6 +115,52 @@ TEST_P(EngineStopTest, StopWaitsForInFlightPrefillOnlyDispatch) {
 }
 
 INSTANTIATE_TEST_SUITE_P(SerialAndParallel, EngineStopTest, ::testing::Values(0, 2));
+
+TEST(AccuracyCheckExecutorTest, DisablesProductionSideEffects) {
+    CustomConfig config;
+    config.output_dispatcher_worker_count = 2;
+    ModelConfig   model_config;
+    RuntimeConfig runtime_config;
+    KVCacheConfig kv_cache_config;
+    auto          params               = createEngineInitParams(config, model_config, runtime_config, kv_cache_config);
+    NormalExecutor::test_model_factory = [vocab = model_config.vocab_size](const GptModelInitParams&) {
+        return std::make_unique<MockModel>(vocab);
+    };
+    struct FactoryResetGuard {
+        ~FactoryResetGuard() {
+            NormalExecutor::test_model_factory = nullptr;
+        }
+    } factory_reset_guard;
+
+    NormalExecutor executor(params, nullptr, false, false, 0, MlaOpsType::AUTO, nullptr, nullptr, false, true);
+    EXPECT_FALSE(executor.useStreamAsync());
+    EXPECT_EQ(executor.metrics_reporter_, nullptr);
+    EXPECT_EQ(executor.model_inputs_logger_, nullptr);
+    EXPECT_EQ(executor.batch_stream_processor_->output_dispatcher_->thread_pool_, nullptr);
+}
+
+TEST(AccuracyCheckCacheTest, RejectsZeroBlockSize) {
+    KVCacheConfig kv_cache_config;
+    EXPECT_THROW(AccuracyChecker::computeTemporaryBlockNum(0, kv_cache_config), std::exception);
+}
+
+TEST(AccuracyCheckPromptTest, IsDeterministicAndLengthDependent) {
+    ModelConfig       model_config;
+    RuntimeConfig     runtime_config;
+    ParallelismConfig parallelism_config;
+    model_config.vocab_size     = 1024;
+    model_config.embedding_size = 512;
+    AccuracyChecker checker(model_config, runtime_config, parallelism_config, true);
+
+    const auto first  = checker.makeCheckPrompt(128);
+    const auto second = checker.makeCheckPrompt(128);
+    const auto longer = checker.makeCheckPrompt(129);
+
+    EXPECT_TRUE(torch::equal(first, second));
+    EXPECT_FALSE(torch::equal(first.slice(0, 0, 128), longer.slice(0, 0, 128)));
+    EXPECT_GE(first.min().item<int32_t>(), 0);
+    EXPECT_LT(first.max().item<int32_t>(), 512);
+}
 
 }  // namespace
 }  // namespace rtp_llm
