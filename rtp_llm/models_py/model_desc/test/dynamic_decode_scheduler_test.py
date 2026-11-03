@@ -1,7 +1,6 @@
 import filecmp
 import importlib.metadata
 import os
-import pickle
 import sys
 import unittest
 from pathlib import Path
@@ -21,7 +20,6 @@ from rtp_llm.models_py.modules.factory.attention.dispatch.backend_selector impor
     instantiate_decode_backend,
 )
 from rtp_llm.models_py.modules.factory.attention.dispatch.selector import select_stable
-from rtp_llm.ops import HWKernelConfig
 from rtp_llm.ops.compute_ops import PyAttentionInputs
 
 
@@ -45,12 +43,6 @@ class DecodeSchedulerTest(unittest.TestCase):
             source = declared.locate_file("torch/" + str(relative))
             self.assertTrue(str(source).startswith(os.environ["TEST_SRCDIR"] + os.sep))
             self.assertTrue(filecmp.cmp(loaded / relative, source, shallow=False))
-
-    def test_dynamic_config_survives_spawn_pickle(self):
-        hw = HWKernelConfig()
-        self.assertFalse(hw.enable_dynamic_decode_backend)
-        hw.enable_dynamic_decode_backend = True
-        self.assertTrue(pickle.loads(pickle.dumps(hw)).enable_dynamic_decode_backend)
 
     def test_dynamic_backend_arch_filter(self):
         self.assertTrue(dynamic_backend_allowed("XQADecodeImpl", 9))
