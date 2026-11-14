@@ -1,6 +1,26 @@
 load(":defs.bzl", "SMOKE_FRAMEWORK_DEPS", "custom_smoke_test", "smoke_test")
 package(default_visibility = ["//visibility:public"])
 
+# CI-only coverage; never merge this matrix into PR1563.
+# These capture buckets match the gate's validated batches (not an untested 2).
+DYNAMIC_DECODE_CI_ARGS = "--disable_flashinfer_native 0 --act_type BF16 --reserver_runtime_mem_mb 8192 --tp_size 1 --warm_up 0 --seq_size_per_block 64 --enable_cuda_graph 1 --decode_capture_config 1,3,8"
+
+test_suite(
+    name = "dynamic_decode_ci_h20",
+    tests = [
+        smoke_test(
+            name = "dynamic_decode_ci_h20_kv%d_%s" % (fp8, mode),
+            task_info = "data/model/qwen3/q_r_block_fp8_flashinfer_decode.json",
+            smoke_args = DYNAMIC_DECODE_CI_ARGS
+            + " --fp8_kv_cache %d --enable_dynamic_decode_backend %d" % (fp8, enabled),
+            gpu_type = ["H20_CU13"],
+        )
+        for fp8 in [0, 1]
+        for mode, enabled in [("off", 0), ("on", 1)]
+    ],
+    tags = ["manual"],
+)
+
 # Framework source files for cross-package smoke tests.
 # Used as data dep (not srcs/deps) so internal smoke targets can merge their
 # own smoke/ children through smoke.__path__ without duplicating runner srcs.
