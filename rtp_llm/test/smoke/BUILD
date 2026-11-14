@@ -2,7 +2,7 @@ load(":defs.bzl", "SMOKE_FRAMEWORK_DEPS", "custom_smoke_test", "smoke_test")
 package(default_visibility = ["//visibility:public"])
 
 # CI-only coverage; never merge this matrix into PR1563.
-# These capture buckets match the gate's validated batches (not an untested 2).
+# default_on deliberately omits the dynamic switch to exercise the service default.
 DYNAMIC_DECODE_CI_ARGS = "--disable_flashinfer_native 0 --act_type BF16 --reserver_runtime_mem_mb 8192 --tp_size 1 --warm_up 0 --seq_size_per_block 64 --enable_cuda_graph 1 --decode_capture_config 1,3,8"
 
 test_suite(
@@ -14,11 +14,12 @@ test_suite(
                 "fp8kv_h20cu13" if fp8 else "bf16kv_h20cu13"
             ),
             smoke_args = DYNAMIC_DECODE_CI_ARGS
-            + " --fp8_kv_cache %d --enable_dynamic_decode_backend %d" % (fp8, enabled),
+            + " --fp8_kv_cache %d" % fp8
+            + (" --enable_dynamic_decode_backend 0" if mode == "off" else ""),
             gpu_type = ["H20_CU13"],
         )
         for fp8 in [0, 1]
-        for mode, enabled in [("off", 0), ("on", 1)]
+        for mode in ["off", "default_on"]
     ],
     tags = ["manual"],
 )

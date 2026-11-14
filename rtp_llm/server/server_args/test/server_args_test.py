@@ -127,7 +127,7 @@ class DynamicDecodeArgumentsTest(TestCase):
         from rtp_llm.server.server_args import server_args
 
         with patch.dict(os.environ, {"ENABLE_ACCURACY_CHECK": "1"}, clear=True):
-            configs = server_args.setup_args([])
+            configs = server_args.setup_args(["--enable_dynamic_decode_backend", "0"])
             self.assertFalse(hasattr(configs.runtime_config, "enable_accuracy_check"))
             restored = pickle.loads(pickle.dumps(configs.runtime_config))
             self.assertFalse(hasattr(restored, "enable_accuracy_check"))
@@ -143,10 +143,21 @@ class DynamicDecodeArgumentsTest(TestCase):
     def test_dynamic_decode_backend_parser_and_default(self):
         from rtp_llm.server.server_args import server_args
 
-        enabled = server_args.setup_args(["--enable_dynamic_decode_backend", "1"])
-        disabled = server_args.setup_args([])
-        self.assertTrue(enabled.py_hw_kernel_config.enable_dynamic_decode_backend)
-        self.assertFalse(disabled.py_hw_kernel_config.enable_dynamic_decode_backend)
+        with patch.dict(os.environ, {}, clear=True):
+            default = server_args.setup_args([])
+            enabled = server_args.setup_args(["--enable_dynamic_decode_backend", "1"])
+            disabled = server_args.setup_args(["--enable_dynamic_decode_backend", "0"])
+            self.assertTrue(default.py_hw_kernel_config.enable_dynamic_decode_backend)
+            self.assertTrue(enabled.py_hw_kernel_config.enable_dynamic_decode_backend)
+            self.assertFalse(disabled.py_hw_kernel_config.enable_dynamic_decode_backend)
+            restored = pickle.loads(pickle.dumps(default.py_hw_kernel_config))
+            self.assertTrue(restored.enable_dynamic_decode_backend)
+
+        with patch.dict(os.environ, {"ENABLE_DYNAMIC_DECODE_BACKEND": "0"}, clear=True):
+            disabled = server_args.setup_args([])
+            enabled = server_args.setup_args(["--enable_dynamic_decode_backend", "1"])
+            self.assertFalse(disabled.py_hw_kernel_config.enable_dynamic_decode_backend)
+            self.assertTrue(enabled.py_hw_kernel_config.enable_dynamic_decode_backend)
 
 
 class CacheConfigArgumentsTest(TestCase):
