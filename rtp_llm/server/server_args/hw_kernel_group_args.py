@@ -118,7 +118,7 @@ def init_hw_kernel_group_args(parser, hw_kernel_config):
         env_name="ENABLE_DYNAMIC_DECODE_BACKEND",
         bind_to=(hw_kernel_config, "enable_dynamic_decode_backend"),
         type=str2bool,
-        default=False,
+        default=True,
         help="Validate and benchmark decode attention backends before graph capture",
     )
     ##############################################################################################################
