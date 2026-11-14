@@ -73,36 +73,6 @@ void releaseHostMemoryCache() {
 #endif
 }
 
-#if USING_CUDA
-std::vector<AccuracyScenario> accuracyScenariosForDecodeGraphs(const RuntimeConfig& runtime_config,
-                                                               const HWKernelConfig& hw_kernel_config) {
-    auto scenarios = AccuracyChecker::defaultScenarios();
-    std::set<size_t> covered_batches;
-    for (const auto& scenario : scenarios) {
-        covered_batches.insert(scenario.seqs.size());
-    }
-
-    std::vector<int> buckets = hw_kernel_config.decode_capture_batch_sizes;
-    if (buckets.empty()) {
-        buckets = CudaGraphRunner::defaultDecodeBatchSizesToCapture(
-            static_cast<int>(runtime_config.max_generate_batch_size));
-    }
-
-    std::sort(buckets.begin(), buckets.end());
-    buckets.erase(std::unique(buckets.begin(), buckets.end()), buckets.end());
-    for (int batch : buckets) {
-        if (batch <= 0 || static_cast<size_t>(batch) > static_cast<size_t>(runtime_config.max_generate_batch_size)
-            || covered_batches.count(static_cast<size_t>(batch)) != 0) {
-            continue;
-        }
-        AccuracyScenario representative;
-        representative.seqs.assign(static_cast<size_t>(batch), AccuracySeq{0, 1, 1});
-        scenarios.push_back(std::move(representative));
-    }
-    return scenarios;
-}
-#endif
-
 bool shouldUseDeviceMallocKVCacheBacking(const PDSepConfig& pd_sep_config, const CacheStoreConfig& cache_store_config) {
     // Only PD cache-store RDMA registers KV cache as user MR.  Keep the
     // raw device allocation backing out of direct KVCacheManager users and non-RDMA
@@ -878,6 +848,45 @@ void NormalEngine::initializeAndPublishCacheManager(ResourceContext&            
     resource_context.role_type     = role_type;
 }
 
+#if USING_CUDA
+std::vector<AccuracyScenario> NormalEngine::accuracyScenariosForStartup(const ModelConfig& model_config,
+                                                                      const RuntimeConfig& runtime_config,
+                                                                      const KVCacheConfig& cache_config,
+                                                                      size_t block_size,
+                                                                      size_t temporary_block_num) {
+    const auto executable = [&](const AccuracyScenario& scenario) {
+        size_t max_plain = 0, max_seq = 0;
+        for (const auto& seq : scenario.seqs) {
+            max_plain = std::max(max_plain, seq.prefix_len + seq.chunk_len);
+            max_seq = std::max(max_seq, seq.prefix_len + seq.chunk_len + seq.decode_steps);
+        }
+        // Match runCheck(), including its strict token-budget comparison.
+        const auto token_budget = runtime_config.fifo_scheduler_config.max_batch_tokens_size;
+        return !scenario.seqs.empty()
+               && scenario.seqs.size() <= static_cast<size_t>(runtime_config.max_generate_batch_size)
+               && (token_budget == 0 || max_plain * scenario.seqs.size() < static_cast<size_t>(token_budget))
+               && max_seq <= static_cast<size_t>(model_config.max_seq_len) && max_seq <= 65536
+               && AccuracyChecker::computeTemporaryBlockNum(block_size, cache_config, {scenario}) <= temporary_block_num;
+    };
+    std::vector<AccuracyScenario> scenarios;
+    bool has_decode = false;
+    for (const auto& scenario : AccuracyChecker::defaultScenarios()) {
+        if (executable(scenario)) {
+            scenarios.push_back(scenario);
+            has_decode |= std::any_of(scenario.seqs.begin(), scenario.seqs.end(),
+                                      [](const auto& seq) { return seq.decode_steps > 0; });
+        }
+    }
+    if (!has_decode) {
+        AccuracyScenario minimal{{{0, 1, 1}}};
+        RTP_LLM_CHECK_WITH_INFO(executable(minimal),
+                               "accuracy check requires capacity for batch 1, one prompt token and one decode step");
+        scenarios.push_back(std::move(minimal));
+    }
+    return scenarios;
+}
+#endif
+
 absl::Status NormalEngine::runAttentionAccuracyCheck(const EngineInitParams& params) {
 #if !USING_CUDA
     return absl::UnimplementedError("attention accuracy check requires CUDA");
@@ -905,10 +914,14 @@ absl::Status NormalEngine::runAttentionAccuracyCheck(const EngineInitParams& par
         || cache_config.topology().groups().front().policy.group_type != CacheGroupType::FULL) {
         return absl::FailedPreconditionError("attention accuracy check requires one FULL KV cache group");
     }
-    const auto accuracy_scenarios = accuracyScenariosForDecodeGraphs(runtime_config, params.hw_kernel_config);
+    auto accuracy_scenarios = accuracyScenariosForStartup(
+        model_config_, runtime_config, check_config, cache_config.seq_size_per_block, std::numeric_limits<size_t>::max());
     cache_config.finalizeBlockNums(
         AccuracyChecker::computeTemporaryBlockNum(cache_config.seq_size_per_block, check_config, accuracy_scenarios),
         runtime_config);
+    accuracy_scenarios = accuracyScenariosForStartup(
+        model_config_, runtime_config, check_config, cache_config.seq_size_per_block,
+        cache_config.topology().groups().front().block_num);
     ResourceContext check_context;
     check_context.initCacheConfig(check_config);
     check_context.role_type  = pd_sep_config.role_type;

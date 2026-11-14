@@ -253,6 +253,8 @@ TEST(AccuracyCheckExecutorTest, DisablesProductionSideEffects) {
     RuntimeConfig runtime_config;
     KVCacheConfig kv_cache_config;
     auto          params               = createEngineInitParams(config, model_config, runtime_config, kv_cache_config);
+    params.eplb_config.eplb_mode = EplbMode::EPLB;
+    model_config.moe_style = 1;
     NormalExecutor::test_model_factory = [vocab = model_config.vocab_size](const GptModelInitParams&) {
         return std::make_unique<MockModel>(vocab);
     };
@@ -267,9 +269,88 @@ TEST(AccuracyCheckExecutorTest, DisablesProductionSideEffects) {
     EXPECT_EQ(executor.metrics_reporter_, nullptr);
     EXPECT_EQ(executor.model_inputs_logger_, nullptr);
     EXPECT_EQ(executor.batch_stream_processor_->output_dispatcher_->thread_pool_, nullptr);
+    EXPECT_EQ(executor.expert_balancer_, nullptr);
+}
+
+TEST(AccuracyCheckExecutorTest, OnlyServingExecutorOwnsSharedPythonModel) {
+    ModelConfig   model_config;
+    RuntimeConfig runtime_config;
+    KVCacheConfig kv_cache_config;
+    auto          params               = createEngineInitParams({}, model_config, runtime_config, kv_cache_config);
+    bool          owns_py_model        = false;
+    NormalExecutor::test_model_factory = [&](const GptModelInitParams& model_params) {
+        owns_py_model = model_params.owns_py_model;
+        return std::make_unique<MockModel>(model_config.vocab_size);
+    };
+    struct FactoryResetGuard {
+        ~FactoryResetGuard() {
+            NormalExecutor::test_model_factory = nullptr;
+        }
+    } factory_reset_guard;
+    for (bool warm_up : {false, true}) {
+        for (bool accuracy_check : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "warm_up=" << warm_up << ", accuracy_check=" << accuracy_check);
+            NormalExecutor executor(params, nullptr, warm_up, false, 0, nullptr, nullptr, false, accuracy_check);
+            EXPECT_EQ(owns_py_model, !warm_up && !accuracy_check);
+        }
+    }
 }
 
 #if USING_CUDA
+TEST(AccuracyCheckScenariosTest, KeepsTypicalDecodeOrAddsOneExecutableFallback) {
+    ModelConfig model;
+    RuntimeConfig runtime;
+    KVCacheConfig cache;
+    ParallelismConfig parallel;
+    parallel.world_size = 1;
+    const auto select = [&] {
+        return NormalEngine::accuracyScenariosForStartup(model, runtime, cache, 64, 512);
+    };
+    const auto check = [&](const auto& scenarios) {
+        AccuracyChecker checker(model, runtime, parallel);
+        size_t decode_count = 0;
+        for (const auto& scenario : scenarios) {
+            EXPECT_TRUE(checker.runCheck(scenario, "startup"));
+            for (const auto& seq : scenario.seqs) {
+                decode_count += seq.decode_steps > 0;
+            }
+        }
+        EXPECT_GT(decode_count, 0);
+    };
+    model.max_seq_len = 8192;
+    runtime.max_generate_batch_size = 32;
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 32768;
+    auto scenarios = select();
+    EXPECT_EQ(scenarios.size(), AccuracyChecker::defaultScenarios().size());
+    check(scenarios);
+    for (auto limits : {std::pair<int, int>{1, 512}, {8, 64}}) {
+        runtime.max_generate_batch_size = limits.first;
+        model.max_seq_len = limits.second;
+        scenarios = select();
+        check(scenarios);
+        EXPECT_EQ(scenarios.back().seqs.size(), 1);
+        EXPECT_EQ(scenarios.back().seqs[0].decode_steps, 1);
+    }
+    // Plain prefill survives the token budget; every typical decode is filtered.
+    runtime.max_generate_batch_size = 8;
+    model.max_seq_len = 8192;
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 129;
+    scenarios = select();
+    check(scenarios);
+    EXPECT_EQ(scenarios.size(), 2);
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 128;
+    EXPECT_EQ(select().size(), 1);
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 2;
+    check(select());
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 1;
+    EXPECT_THROW(select(), std::exception);
+    runtime.fifo_scheduler_config.max_batch_tokens_size = 0;
+    model.max_seq_len = 1;
+    EXPECT_THROW(select(), std::exception);
+    model.max_seq_len = 64;
+    EXPECT_THROW(NormalEngine::accuracyScenariosForStartup(model, runtime, cache, 64, 1), std::exception);
+}
+
 TEST(DecodeCaptureBucketsTest, PreservesDefaultGraphShapesAndFinalCapacity) {
     EXPECT_EQ(CudaGraphRunner::defaultDecodeBatchSizesToCapture(1), std::vector<int>({1}));
     EXPECT_EQ(CudaGraphRunner::defaultDecodeBatchSizesToCapture(7), std::vector<int>({1, 7}));

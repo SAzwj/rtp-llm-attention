@@ -20,6 +20,8 @@
 
 namespace rtp_llm {
 
+struct AccuracyScenario;
+
 class NormalEngine: public EngineBase {
 public:
     NormalEngine(const EngineInitParams& params, std::unique_ptr<ProposeModelEngineInitParams> propose_params);
@@ -49,6 +51,13 @@ public:
 
 private:
     static int calculateReserveStep(const EngineInitParams& params);
+#if USING_CUDA
+    static std::vector<AccuracyScenario> accuracyScenariosForStartup(const ModelConfig& model_config,
+                                                                    const RuntimeConfig& runtime_config,
+                                                                    const KVCacheConfig& cache_config,
+                                                                    size_t block_size,
+                                                                    size_t temporary_block_num);
+#endif
 
     void                            initScheduler();
     std::shared_ptr<GenerateStream> createStream(const std::shared_ptr<GenerateInput>& input);

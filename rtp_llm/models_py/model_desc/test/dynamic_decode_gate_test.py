@@ -1,7 +1,10 @@
 import copy
 import json
+import multiprocessing
 import tempfile
 import unittest
+from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -27,8 +30,8 @@ from rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder import (
     _GoldenFeedback,
 )
 from rtp_llm.models_py.modules.factory.attention.dispatch.precision_metrics import (
-    DecodeGateConfig,
     FP8_GATE_CONFIG,
+    DecodeGateConfig,
     evaluate_precision,
     gate_config,
     load_gate_profiles,
@@ -36,6 +39,101 @@ from rtp_llm.models_py.modules.factory.attention.dispatch.precision_metrics impo
     validate_calibration_target,
 )
 from rtp_llm.ops import KvCacheDataType
+
+
+def _gate_world_worker(
+    rank, rendezvous, result_dir, fail_rank, backend="gloo", fail_allocation=0
+):
+    import torch.distributed as dist
+
+    module = "rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder"
+    device = "cpu"
+    if backend == "nccl":
+        torch.cuda.set_device(rank)
+        device = f"cuda:{rank}"
+    dist.init_process_group(
+        backend,
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    installed, operations = [], []
+    status = torch.ones(1, dtype=torch.int32, device=device)
+    original_empty = torch.empty
+    allocations = 0
+    model = SimpleNamespace(
+        prepare_fmha_impl=lambda: None,
+        layer_num=1,
+        config=SimpleNamespace(
+            getAttentionConfigs=lambda size: SimpleNamespace(
+                rope_config=None, max_seq_len=128
+            )
+        ),
+        parallelism_config=SimpleNamespace(world_size=2, get_attn_tp_size=lambda: 1),
+        set_decode_backend_gate=installed.append,
+    )
+
+    def allocate(*args, **kwargs):
+        nonlocal allocations
+        current = allocations
+        allocations += 1
+        if rank == fail_rank and current == fail_allocation:
+            raise MemoryError("injected candidate mask allocation failure")
+        kwargs["device"] = device
+        return original_empty(*args, **kwargs)
+
+    def reduce(mask, group):
+        operations.append(("SUM", mask.numel()))
+        dist.all_reduce(mask, op=dist.ReduceOp.SUM)
+
+    error = None
+    try:
+        with patch(module + ".DECODE_MHA_IMPS", [type("Good", (), {})]), patch(
+            module + ".PREFILL_MHA_IMPS", [type("Good", (), {})]
+        ), patch(module + ".torch.empty", side_effect=allocate), patch(
+            "rtp_llm.models_py.modules.factory.attention.accuracy.tensor_recorder.get_rope_cache_once"
+        ):
+            try:
+                recorder = GateRecorder(model)
+            except MemoryError as exc:
+                error = str(exc)
+                status.zero_()
+        # Mirror AccuracyChecker's existing recorder-init status convergence.
+        operations.append(("MIN", 1))
+        dist.all_reduce(status, op=dist.ReduceOp.MIN)
+        if status.item():
+            recorder._profile = (False, gate_config(False))
+            recorder._current_scenario_base_name = "s"
+            recorder._candidates = {"decode_0": ["Good"]}
+            recorder.active_ids = {("s", "decode_0"): (0, 1)}
+            recorder.records, _ = records_fixture()
+            with patch(module + ".all_reduce", side_effect=reduce), patch(
+                module + ".get_sm", return_value=(9, 0)
+            ), patch(
+                module + ".torch.empty",
+                side_effect=AssertionError("collective storage allocated after init"),
+            ), patch(
+                module + ".torch.tensor",
+                side_effect=AssertionError("collective tensor created after init"),
+            ), patch.object(
+                recorder, "_calibration_coverage", return_value={}
+            ):
+                assert recorder.list_candidates("decode_0") == ["Good"]
+                recorder.finalize()
+            recorder.close()
+        Path(result_dir, f"rank-{rank}.json").write_text(
+            json.dumps(
+                dict(
+                    ready=bool(status.item()),
+                    error=error,
+                    installed=installed,
+                    operations=operations,
+                )
+            )
+        )
+    finally:
+        dist.destroy_process_group()
 
 
 def records_fixture():
@@ -174,9 +272,32 @@ class DecodePrecisionGateTest(unittest.TestCase):
 
     def test_fp8_and_bf16_use_independent_calibrations(self):
         self.assertEqual(gate_config(False).calibration_id, "h20-qwen3-20261030-v1")
-        self.assertEqual(gate_config(True).calibration_id, "h20-qwen3-fp8-20261105-v2")
+        self.assertEqual(gate_config(True).calibration_id, "h20-qwen3-fp8-20261115-v3")
         self.assertEqual(gate_config(False).cosine_limit, 0.9995)
         self.assertEqual(gate_config(True).cosine_limit, FP8_GATE_CONFIG.cosine_limit)
+
+    def test_fp8_total_error_budget_keeps_gain_and_direction_guards(self):
+        golden = torch.ones(1, 128, dtype=torch.bfloat16)
+        noise = golden.clone()
+        noise[:, ::2] *= -1
+        candidate = golden * 0.925 + noise * 0.29
+        contribution = torch.ones(1, 2)
+        old = replace(gate_config(True), cosine_limit=0.975, nrmse_limit=0.21)
+        self.assertFalse(
+            evaluate_precision(candidate, golden, contribution, True, old)[
+                "overall_pass"
+            ]
+        )
+        self.assertTrue(
+            evaluate_precision(candidate, golden, contribution, True)["overall_pass"]
+        )
+        self.assertFalse(
+            evaluate_precision(candidate, golden, contribution, False)["overall_pass"]
+        )
+        for bad in (golden * 1.2, -golden, golden + noise * 0.5):
+            self.assertFalse(
+                evaluate_precision(bad, golden, contribution, True)["overall_pass"]
+            )
 
     def test_zero_output_is_valid(self):
         self.assertTrue(
@@ -410,17 +531,21 @@ class DecodePrecisionGateTest(unittest.TestCase):
             ),
             set_decode_backend_gate=lambda names: None,
         )
+        original_empty = torch.empty
         with patch(
             "rtp_llm.models_py.modules.factory.attention.accuracy.tensor_recorder.get_rope_cache_once"
+        ), patch(
+            "rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder.DECODE_MHA_IMPS",
+            [Good],
+        ), patch(
+            "rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder.torch.empty",
+            side_effect=lambda *args, **kwargs: original_empty(
+                *args, **{**kwargs, "device": "cpu"}
+            ),
         ):
             recorder = GateRecorder(model)
         recorder.records, recorder.expected = records, expected
         module = "rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder"
-        original_tensor = torch.tensor
-
-        def cpu_tensor(*args, **kwargs):
-            kwargs["device"] = "cpu"
-            return original_tensor(*args, **kwargs)
 
         def other_rank_failed(mask, group):
             from rtp_llm.models_py.distributed.collective_torch import Group
@@ -429,9 +554,7 @@ class DecodePrecisionGateTest(unittest.TestCase):
             mask[0] += 0
             mask[1:] += 1
 
-        with patch(module + ".DECODE_MHA_IMPS", [Good]), patch(
-            module + ".torch.tensor", side_effect=cpu_tensor
-        ), patch(module + ".all_reduce", side_effect=other_rank_failed):
+        with patch(module + ".all_reduce", side_effect=other_rank_failed):
             with self.assertRaisesRegex(RuntimeError, "at least one rank"):
                 recorder.finalize()
 
@@ -515,6 +638,113 @@ class DecodePrecisionGateTest(unittest.TestCase):
 
 
 class DecodeGateThresholdInjectionTest(unittest.TestCase):
+    def test_two_rank_mask_allocation_and_collective_order(self):
+        context = multiprocessing.get_context("spawn")
+        for fail_rank, allocation in ((-1, 0), (1, 0), (1, 1), (1, 2)):
+            with self.subTest(
+                fail_rank=fail_rank, allocation=allocation
+            ), tempfile.TemporaryDirectory() as tmp:
+                workers = [
+                    context.Process(
+                        target=_gate_world_worker,
+                        args=(
+                            rank,
+                            str(Path(tmp, "rendezvous")),
+                            tmp,
+                            fail_rank,
+                            "gloo",
+                            allocation,
+                        ),
+                    )
+                    for rank in range(2)
+                ]
+                try:
+                    for worker in workers:
+                        worker.start()
+                    for worker in workers:
+                        worker.join(timeout=60)
+                    self.assertTrue(all(not worker.is_alive() for worker in workers))
+                    self.assertEqual([worker.exitcode for worker in workers], [0, 0])
+                    results = [
+                        json.loads(Path(tmp, f"rank-{rank}.json").read_text())
+                        for rank in range(2)
+                    ]
+                    expected_ops = (
+                        [["MIN", 1], ["SUM", 1], ["SUM", 2]]
+                        if fail_rank == -1
+                        else [["MIN", 1]]
+                    )
+                    for rank, result in enumerate(results):
+                        self.assertEqual(result["operations"], expected_ops)
+                        self.assertEqual(result["ready"], fail_rank == -1)
+                        self.assertEqual(
+                            result["installed"],
+                            (
+                                [None, ["Good"]]
+                                if fail_rank == -1
+                                else ([] if rank == fail_rank else [None])
+                            ),
+                        )
+                    if fail_rank == 1:
+                        self.assertIn("allocation failure", results[1]["error"])
+                finally:
+                    for worker in workers:
+                        if worker.is_alive():
+                            worker.terminate()
+                            worker.join(timeout=5)
+
+    def test_coverage_failure_does_not_block_admission(self):
+        module = "rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder"
+        for report_error in (False, True):
+            recorder = self._recorder()
+            installed = []
+            recorder.model.set_decode_backend_gate = installed.append
+            recorder._passed = frozenset({"Good"})
+            with patch.object(recorder, "_finalize_scenario"), patch.object(
+                recorder,
+                "_calibration_coverage",
+                side_effect=ValueError("bad report") if report_error else None,
+                return_value={"tested_batches": (1,)},
+            ):
+                if report_error:
+                    with self.assertLogs(level="WARNING") as logs:
+                        recorder.finalize()
+                    self.assertIn("coverage report failed", "\n".join(logs.output))
+                else:
+                    recorder.finalize()
+            self.assertEqual(installed, [["Good"]])
+
+    def test_gate_errors_are_not_swallowed_by_report_protection(self):
+        module = "rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder"
+        for failure in ("precision", "records", "world", "install"):
+            recorder = self._recorder()
+            installed = []
+            recorder.model.set_decode_backend_gate = installed.append
+            recorder._passed = (
+                frozenset() if failure == "precision" else frozenset({"Good"})
+            )
+            if failure == "install":
+
+                def fail_install(names):
+                    raise RuntimeError("installation failed")
+
+                recorder.model.set_decode_backend_gate = fail_install
+            if failure == "world":
+                recorder.model.parallelism_config.world_size = 2
+            with patch.object(
+                recorder,
+                "_finalize_scenario",
+                side_effect=ValueError("bad records") if failure == "records" else None,
+            ), patch(
+                module + ".all_reduce", side_effect=RuntimeError("WORLD failed")
+            ), patch.object(
+                recorder, "_calibration_coverage"
+            ) as report:
+                with self.assertRaises(RuntimeError):
+                    recorder.finalize()
+                report.assert_not_called()
+            self.assertEqual(installed, [])
+
     def _thresholds(self):
         config = gate_config(False).to_dict()
         config.pop("calibration_sm_major")
@@ -539,11 +769,20 @@ class DecodeGateThresholdInjectionTest(unittest.TestCase):
             ),
             set_decode_backend_gate=lambda names: None,
         )
+        original_empty = torch.empty
         with patch.dict("os.environ", environment or {}, clear=True), patch(
             "rtp_llm.models_py.modules.factory.attention.accuracy.tensor_recorder.get_rope_cache_once"
         ), patch(
             "rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder.get_sm",
             return_value=(9, 0),
+        ), patch(
+            "rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder.DECODE_MHA_IMPS",
+            [type("Good", (), {})],
+        ), patch(
+            "rtp_llm.models_py.modules.factory.attention.dispatch.gate_recorder.torch.empty",
+            side_effect=lambda *args, **kwargs: original_empty(
+                *args, **{**kwargs, "device": "cpu"}
+            ),
         ):
             recorder = GateRecorder(model)
             recorder._gate_profile()

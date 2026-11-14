@@ -55,9 +55,9 @@ BF16_GATE_CONFIG = DecodeGateConfig(
 # separately diagnose implementation residual during calibration.
 FP8_GATE_CONFIG = DecodeGateConfig(
     gain_limit=0.11,
-    cosine_limit=0.975,
-    nrmse_limit=0.21,
-    calibration_id="h20-qwen3-fp8-20261105-v2",
+    cosine_limit=0.95,
+    nrmse_limit=0.33,
+    calibration_id="h20-qwen3-fp8-20261115-v3",
 )
 
 

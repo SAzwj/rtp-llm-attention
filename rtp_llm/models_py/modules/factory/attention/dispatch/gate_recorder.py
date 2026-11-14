@@ -22,6 +22,9 @@ from rtp_llm.models_py.modules.factory.attention.attn_factory import (
     DECODE_MHA_IMPS,
     PREFILL_MHA_IMPS,
 )
+from rtp_llm.models_py.modules.factory.attention.dispatch.backend_selector import (
+    dynamic_backend_allowed,
+)
 from rtp_llm.models_py.modules.factory.attention.dispatch.decode_gate import (
     build_decode_gate,
 )
@@ -278,6 +281,10 @@ class GateRecorder(TensorRecorder):
             cls.__name__ for cls, count in zip(registry, counts) if count == world_size
         ]
         if phase.startswith("decode_"):
+            sm_major = get_sm()[0]
+            candidates = [
+                name for name in candidates if dynamic_backend_allowed(name, sm_major)
+            ]
             key = (self._current_scenario_base_name, phase)
             if key in self.expected:
                 raise ValueError(f"duplicate candidate schedule {key}")
@@ -334,17 +341,23 @@ class GateRecorder(TensorRecorder):
         ]
         if not names:
             raise RuntimeError("no decode backend passed every scenario on every rank")
-        calibration_coverage = self._calibration_coverage(profile.calibration_id)
         self.model.set_decode_backend_gate(names)
         logging.info(
             "decode gate WORLD passed=%s threshold_source=%s threshold_id=%s "
-            "threshold_sha256=%s calibration_coverage=%s",
+            "threshold_sha256=%s",
             names,
             self.threshold_source,
             profile.calibration_id,
             self.threshold_sha256,
-            calibration_coverage,
         )
+        try:
+            calibration_coverage = self._calibration_coverage(profile.calibration_id)
+        except Exception:
+            logging.warning(
+                "decode gate calibration coverage report failed", exc_info=True
+            )
+        else:
+            logging.info("decode gate calibration_coverage=%s", calibration_coverage)
 
     def _calibration_coverage(self, calibration_id):
         batches = set()

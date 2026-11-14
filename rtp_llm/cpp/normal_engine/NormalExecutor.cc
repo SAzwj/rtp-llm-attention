@@ -125,7 +125,7 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
                                                 metrics_reporter_);
     }
 
-    if (params.eplb_config.enable_eplb() && params.model_config_.moe_style != 0) {
+    if (params.eplb_config.enable_eplb() && params.model_config_.moe_style != 0 && !accuracy_check_mode_) {
         // use first moe layer weight as moe weight type
         int         first_moe_layer = params.model_config_.moe_layer_index.front();
         const auto& moe_kernel      = params.gpt_weights.layers[first_moe_layer].ffn_weights.moe_gate_weight->kernel;
