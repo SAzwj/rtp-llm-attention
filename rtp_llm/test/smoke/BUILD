@@ -10,7 +10,9 @@ test_suite(
     tests = [
         smoke_test(
             name = "dynamic_decode_ci_h20_kv%d_%s" % (fp8, mode),
-            task_info = "data/model/qwen3/q_r_block_fp8_flashinfer_decode.json",
+            task_info = "data/model/qwen3/q_r_block_fp8_flashinfer_decode_%s.json" % (
+                "fp8kv_h20cu13" if fp8 else "bf16kv_h20cu13"
+            ),
             smoke_args = DYNAMIC_DECODE_CI_ARGS
             + " --fp8_kv_cache %d --enable_dynamic_decode_backend %d" % (fp8, enabled),
             gpu_type = ["H20_CU13"],
