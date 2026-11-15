@@ -92,9 +92,11 @@ class GptModelBase(nn.Module):
                 "dynamic decode cannot start before precision qualification"
             )
         if enabled and getattr(self.config, "headwise_config", None) is not None:
-            raise NotImplementedError(
-                "dynamic decode precision gate does not qualify headwise attention"
+            logging.warning(
+                "dynamic decode disabled, falling back to static path: "
+                "precision gate does not qualify headwise attention"
             )
+            enabled = False
         self._dynamic_decode_enabled = enabled
         self.decode_backend_plan.clear()
 

@@ -909,6 +909,14 @@ absl::StatusOr<bool> NormalEngine::runAttentionAccuracyCheck(const EngineInitPar
                             "multimodal or CP/PP, with CUDA Graph enabled");
         return false;
     }
+    {
+        py::gil_scoped_acquire gil;
+        if (!py::getattr(params.py_model.attr("config"), "headwise_config", py::none()).is_none()) {
+            RTP_LLM_LOG_WARNING("dynamic decode disabled, falling back to static path: "
+                                "attention accuracy check does not qualify headwise attention");
+            return false;
+        }
+    }
     auto check_config                = kv_cache_config;
     check_config.reuse_cache         = false;
     check_config.enable_device_cache = false;

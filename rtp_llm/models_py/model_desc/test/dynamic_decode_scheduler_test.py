@@ -144,6 +144,34 @@ class DecodePlanTest(unittest.TestCase):
             self.assertEqual(instantiate.call_count, 3)
             self.assertEqual(set(self.model.decode_backend_plan), {2, 4})
 
+    def test_headwise_with_gate_uses_static_graph_factory(self):
+        self.model.configure_dynamic_decode(True)
+        self.model.decode_backend_plan[2] = self.backend
+        self.model.config.headwise_config = {}
+        module = "rtp_llm.models_py.modules.factory.attention.dispatch.backend_selector"
+        with self.assertLogs(level="WARNING") as logs:
+            self.model.configure_dynamic_decode(True)
+        self.assertIn("does not qualify headwise attention", logs.output[0])
+        self.assertFalse(self.model._dynamic_decode_enabled)
+        self.assertFalse(self.model.decode_backend_plan)
+        with patch(
+            "rtp_llm.models_py.model_desc.module_base.AttnImplFactory.get_fmha_impl",
+            return_value="static",
+        ) as static, patch(module + ".select_decode_backend") as select, patch(
+            module + ".instantiate_decode_backend"
+        ) as instantiate:
+            self.assertEqual(
+                self.model.prepare_fmha_impl(
+                    SimpleNamespace(attention_inputs=self.inputs),
+                    True,
+                    CudaGraphSelectionMode.DECODE_GRAPH,
+                ),
+                "static",
+            )
+        static.assert_called_once()
+        select.assert_not_called()
+        instantiate.assert_not_called()
+
     def test_capture_uses_graph_bucket_without_kv_envelope(self):
         self.model.configure_dynamic_decode(True)
         self.inputs.sequence_lengths = torch.full((2,), 4095, dtype=torch.int32)
