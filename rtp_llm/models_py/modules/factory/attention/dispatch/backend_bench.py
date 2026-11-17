@@ -1,23 +1,12 @@
-"""Real capture-path timing (GPU).
+"""Time CUDA Graph capture/replay using the engine's attention input structure.
 
-Does not hand-build PyAttentionInputs (hand-building drifts with the schema and
-frequently goes all N/A); the inputs are taken from the engine's real
-attention_inputs and LayerKVCache, and only qkv is synthesized (randn; latency
-depends only on shape and memory access, it does not measure precision). Each kv
-grid point does one real-machine capture+replay timing, going through the same
-path and the same kernel as the engine's actual capture, so the schema is always
-correct.
+Benchmark independent input copies, synthetic QKV, and a private synthetic KV
+cache; these timings do not measure accuracy.
 
-Hard constraints:
-  - The throwaway cuda graph uses a private pool (does not pass the shared pool);
-    otherwise, after release, returning to the shared pool and being reused by
-    the actual capture would corrupt it.
-  - After each (impl, kv) capture, release the graph, closures, implementation,
-    workspace, and temporary tensors before synchronizing and emptying the cache;
-    otherwise private-pool reservations can accumulate until OOM.
-  - The caller must ensure this module fully finishes and syncs before entering
-    the engine's actual capture, to avoid nested capture.
-  - Modify lengths and block tables only on clones, with a private KV cache.
+Keep lengths and block-table changes isolated from engine inputs. Use a private
+Graph memory pool, and release graphs, closures, implementations, workspaces, and
+temporary tensors before synchronizing and emptying the allocator cache. Finish
+and synchronize all benchmarking before the engine's capture to avoid nesting.
 """
 
 from __future__ import annotations

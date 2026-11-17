@@ -75,8 +75,8 @@ struct RecordingSession {
     }
 };
 
-// Build a stream and its release guard for each active sequence
-// rank0 only; rank>0 builds no streams and joins the same TP collectives with an empty list.
+// Only TP rank 0 builds request streams and their release guards.
+// All TP ranks execute their model shards using synchronized inputs.
 bool buildBatch(bool                                                            root,
                 const std::vector<size_t>&                                      active_seq_ids,
                 const std::function<absl::StatusOr<GenerateStreamPtr>(size_t)>& make_stream,
@@ -269,7 +269,7 @@ absl::StatusOr<GenerateStreamPtr> AccuracyChecker::makeForkStream(
     RTP_LLM_CHECK_WITH_INFO(cache_resource.getKVBlockUpdateMapping().empty(),
                             "accuracy check: stale block-update mapping before boundary copy");
 
-    // Allocate own blocks for the remainder (decode: one tail; prefix: the chunk blocks)
+    // Allocate independent KV blocks for the fork.
     RETURN_IF_STATUS_ERROR(stream->incrKVBlock());
     const size_t need_blocks = (stream->seqLength() + block_size - 1) / block_size;
     RTP_LLM_CHECK_WITH_INFO(stream->kvCache().blocks(0, cache_tag).size() == need_blocks,
@@ -447,7 +447,7 @@ absl::Status AccuracyChecker::runScenario(const py::object& recorder, const Accu
         return absl::OkStatus();
     }
 
-    // rank0 builds one prompt per sequence (prefix + chunk); rank>0 keeps prompts empty
+    // TP rank 0 builds one prompt per sequence (prefix + chunk); other TP ranks keep prompts empty.
     std::vector<torch::Tensor> prompts;
     bool                       prompts_flag = true;
     if (root) {
@@ -564,7 +564,7 @@ absl::Status AccuracyChecker::runScenario(const py::object& recorder, const Accu
 
     // decode: teacher forcing over a shrinking active set, one batched forward per step
     if (max_decode > 0) {
-        // Capture t0 (each active seq's first decode token, from the plain prefill) before golden decodes
+        // TP rank 0 collects t0 (each active sequence's first decode token) from the plain prefill.
         std::vector<std::vector<int>> golden_decode_tokens(batch_size);
         bool                          t0_capture_flag = true;
         if (root) {
@@ -593,7 +593,7 @@ absl::Status AccuracyChecker::runScenario(const py::object& recorder, const Accu
         }
         RETURN_IF_STATUS_ERROR(abortIfFailed(t0_capture_flag, "t0-capture"));
 
-        // golden decodes its trajectory over the (maybe shrinking) active set and collects per-sequence tokens
+        // All TP ranks run golden decode over the shrinking active set; TP rank 0 collects tokens.
         for (size_t step = 0; step < max_decode; ++step) {
             std::vector<size_t> active_seq_ids;
             for (size_t seq_id = 0; seq_id < batch_size; ++seq_id) {
@@ -625,7 +625,7 @@ absl::Status AccuracyChecker::runScenario(const py::object& recorder, const Accu
                                            golden_decode_streams,
                                            active_seq_ids,
                                            golden_block_flag));
-            // append active_seqs golden tokens on rank0
+            // Append golden tokens for the active sequences on TP rank 0.
             if (root) {
                 try {
                     for (size_t seq_id : active_seq_ids) {
